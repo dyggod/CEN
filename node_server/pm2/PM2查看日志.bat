@@ -7,7 +7,7 @@ echo.
 echo 按 Ctrl+C 退出日志查看
 echo.
 
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
-call pm2 logs keltner-webhook --lines 50
+call pm2 logs EA&CTrader-Webhook --lines 50
 

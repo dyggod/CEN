@@ -3,8 +3,9 @@
 
 module.exports = {
   apps: [{
-    name: 'keltner-webhook',
-    script: './server.js',
+    name: 'EA&CTrader-Webhook',
+    script: '../server.js',
+    cwd: '..',
     
     // 实例数量
     instances: 1,
@@ -21,12 +22,12 @@ module.exports = {
     // 环境变量
     env: {
       NODE_ENV: 'production',
-      PORT: 5000
+      PORT: 6699
     },
     
     // 日志配置
-    error_file: './logs/error.log',
-    out_file: './logs/output.log',
+    error_file: '../logs/error.log',
+    out_file: '../logs/output.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     
     // 合并日志

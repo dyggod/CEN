@@ -9,7 +9,7 @@ echo.
 echo 按任意键继续，或关闭窗口取消...
 pause > nul
 
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
 echo.
 echo [1/3] 配置 PM2 开机启动...

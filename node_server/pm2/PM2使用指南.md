@@ -15,7 +15,7 @@ PM2 是一个专业的 Node.js 进程管理器，可以让你的服务：
 
 **方法 A：自动安装（推荐）**
 
-直接双击 `PM2启动.bat`，首次运行会自动安装 PM2。
+直接双击 `pm2/PM2启动.bat`，首次运行会自动安装 PM2。
 
 **方法 B：手动安装**
 
@@ -34,7 +34,7 @@ pm2 --version
 
 ### 2. 启动服务
 
-**双击运行：** `PM2启动.bat`
+**双击运行：** `pm2/PM2启动.bat`
 
 或命令行：
 
@@ -49,7 +49,7 @@ npm run pm2:start
 ┌─────┬──────────────────┬─────────┬─────────┬──────────┬────────┬──────────┐
 │ id  │ name             │ mode    │ ↺      │ status   │ cpu    │ memory   │
 ├─────┼──────────────────┼─────────┼─────────┼──────────┼────────┼──────────┤
-│ 0   │ keltner-webhook  │ fork    │ 0       │ online   │ 0%     │ 30.5mb   │
+│ 0   │ EA&CTrader-Webhook  │ fork    │ 0       │ online   │ 0%     │ 30.5mb   │
 └─────┴──────────────────┴─────────┴─────────┴──────────┴────────┴──────────┘
 ```
 
@@ -68,7 +68,7 @@ npm run pm2:start
 ```bash
 pm2 status
 # 或
-pm2 info keltner-webhook
+pm2 info EA&CTrader-Webhook
 ```
 
 ---
@@ -80,10 +80,10 @@ pm2 info keltner-webhook
 或命令行：
 
 ```bash
-pm2 logs keltner-webhook
+pm2 logs EA&CTrader-Webhook
 
 # 仅看最新 50 行
-pm2 logs keltner-webhook --lines 50
+pm2 logs EA&CTrader-Webhook --lines 50
 
 # 清空日志
 pm2 flush
@@ -102,7 +102,7 @@ pm2 flush
 或命令行：
 
 ```bash
-pm2 restart keltner-webhook
+pm2 restart EA&CTrader-Webhook
 ```
 
 **何时需要重启？**
@@ -119,7 +119,7 @@ pm2 restart keltner-webhook
 或命令行：
 
 ```bash
-pm2 stop keltner-webhook
+pm2 stop EA&CTrader-Webhook
 ```
 
 ⚠️ 停止后服务不会运行，不会响应 Webhook 请求。
@@ -133,10 +133,10 @@ pm2 stop keltner-webhook
 或命令行：
 
 ```bash
-pm2 delete keltner-webhook
+pm2 delete EA&CTrader-Webhook
 ```
 
-⚠️ 删除后需要重新运行 `PM2启动.bat` 才能使用。
+⚠️ 删除后需要重新运行 `pm2/PM2启动.bat` 才能使用。
 
 ---
 
@@ -181,9 +181,9 @@ pm2 monit
 显示类似：
 
 ```
-┌─ Process List ────────────────┐┌─ keltner-webhook Metrics ─────┐
+┌─ Process List ────────────────┐┌─ EA&CTrader-Webhook Metrics ─────┐
 │                                ││ CPU Usage:      0.5%           │
-│ [0] keltner-webhook            ││ Memory Usage:   31.2 MB        │
+│ [0] EA&CTrader-Webhook            ││ Memory Usage:   31.2 MB        │
 │ status: online                 ││ Restart:        0              │
 │ cpu: 0%                        ││ Uptime:         2h 15m         │
 │ memory: 30MB                   ││                                │
@@ -195,7 +195,7 @@ pm2 monit
 ### 查看详细信息
 
 ```bash
-pm2 describe keltner-webhook
+pm2 describe EA&CTrader-Webhook
 ```
 
 显示：
@@ -228,12 +228,12 @@ pm2 delete all
 
 ### 自定义配置
 
-编辑 `ecosystem.config.js`：
+编辑 `pm2/ecosystem.config.js`：
 
 ```javascript
 module.exports = {
   apps: [{
-    name: 'keltner-webhook',
+    name: 'EA&CTrader-Webhook',
     script: './server.js',
     
     // 修改实例数量（负载均衡）
@@ -263,7 +263,7 @@ module.exports = {
 修改后重启生效：
 
 ```bash
-pm2 restart keltner-webhook
+pm2 restart EA&CTrader-Webhook
 ```
 
 ---
@@ -281,10 +281,10 @@ status: errored
 
 ```bash
 # 查看错误日志
-pm2 logs keltner-webhook --err
+pm2 logs EA&CTrader-Webhook --err
 
 # 常见原因：
-# 1. 端口被占用 → 修改 ecosystem.config.js 中的 PORT
+# 1. 端口被占用 → 修改 pm2/ecosystem.config.js 中的 PORT
 # 2. 依赖未安装 → 运行 npm install
 # 3. 配置错误 → 检查 server.js 中的配置
 ```
@@ -302,7 +302,7 @@ pm2 logs keltner-webhook --err
 
 ```bash
 # 查看日志找出原因
-pm2 logs keltner-webhook --lines 100
+pm2 logs EA&CTrader-Webhook --lines 100
 
 # 常见原因：
 # 1. 内存不足 → 增加 max_memory_restart
@@ -356,7 +356,7 @@ npm config get prefix
 
 ### 开发阶段
 
-1. **启动服务：** 双击 `PM2启动.bat`
+1. **启动服务：** 双击 `pm2/PM2启动.bat`
 2. **查看日志：** 双击 `PM2查看日志.bat`（调试用）
 3. **修改代码后：** 双击 `PM2重启.bat`
 
@@ -365,7 +365,7 @@ npm config get prefix
 1. **首次部署：**
    ```bash
    npm install
-   双击 PM2启动.bat
+   双击 pm2/PM2启动.bat
    双击 PM2设置开机启动.bat
    ```
 
@@ -419,7 +419,7 @@ npm config get prefix
 
 ```bash
 # 每周检查一次
-pm2 logs keltner-webhook --lines 100
+pm2 logs EA&CTrader-Webhook --lines 100
 
 # 清理旧日志
 pm2 flush
@@ -441,15 +441,15 @@ pm2 monit
 
 | 操作 | 命令 | 快捷方式 |
 |------|------|---------|
-| 启动 | `pm2 start ecosystem.config.js` | `PM2启动.bat` |
-| 停止 | `pm2 stop keltner-webhook` | `PM2停止.bat` |
-| 重启 | `pm2 restart keltner-webhook` | `PM2重启.bat` |
-| 删除 | `pm2 delete keltner-webhook` | `PM2完全删除.bat` |
-| 状态 | `pm2 status` | `PM2查看状态.bat` |
-| 日志 | `pm2 logs keltner-webhook` | `PM2查看日志.bat` |
+| 启动 | `pm2 start pm2/ecosystem.config.js` | `pm2/PM2启动.bat` |
+| 停止 | `pm2 stop EA&CTrader-Webhook` | `pm2/PM2停止.bat` |
+| 重启 | `pm2 restart EA&CTrader-Webhook` | `pm2/PM2重启.bat` |
+| 删除 | `pm2 delete EA&CTrader-Webhook` | `pm2/PM2完全删除.bat` |
+| 状态 | `pm2 status` | `pm2/PM2查看状态.bat` |
+| 日志 | `pm2 logs EA&CTrader-Webhook` | `pm2/PM2查看日志.bat` |
 | 监控 | `pm2 monit` | - |
-| 详情 | `pm2 describe keltner-webhook` | - |
-| 开机启动 | `pm2 startup && pm2 save` | `PM2设置开机启动.bat` |
+| 详情 | `pm2 describe EA&CTrader-Webhook` | - |
+| 开机启动 | `pm2 startup && pm2 save` | `pm2/PM2设置开机启动.bat` |
 
 ---
 
@@ -464,7 +464,7 @@ pm2 monit
 5. ✅ **便于管理** - 一键启停、查看日志
 
 **推荐做法：**
-1. 首次使用：双击 `PM2启动.bat`
+1. 首次使用：双击 `pm2/PM2启动.bat`
 2. 设置开机启动：双击 `PM2设置开机启动.bat`
 3. 以后忘掉它，服务会自动运行！
 

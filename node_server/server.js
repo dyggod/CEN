@@ -7,11 +7,13 @@ const path = require('path');
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const { convertMT5TimeToUTC8 } = require('./tools/utils');
+const messageQueue = require('./tools/messageQueue');
 
 // ==================== 配置区域 ====================
 const CONFIG = {
     // 服务器端口
-    PORT: 5000,
+    PORT: 6699,
     
     // 邮件配置
     EMAIL: {
@@ -386,6 +388,200 @@ app.post('/notify', async (req, res) => {
     }
 });
 
+/**
+ * 接收EA交易信息（开仓/平仓）
+ */
+app.post('/trade', async (req, res) => {
+    try {
+        console.log('\n' + '='.repeat(60));
+        console.log('📊 收到交易信息');
+        const serverTime = new Date();
+        console.log('服务器当前时间 (UTC):', serverTime.toISOString());
+        console.log('服务器当前时间 (UTC+8):', serverTime.toLocaleString('zh-CN', {
+            timeZone: 'Asia/Shanghai',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+        }));
+        console.log('='.repeat(60));
+        
+        // 解析请求数据
+        const {
+            action,           // 操作类型：'open' 开仓 / 'close' 平仓
+            orderType,        // 订单类型：'buy' / 'sell'
+            symbol,           // 交易品种
+            volume,           // 手数
+            price,            // 价格
+            sl,               // 止损价
+            tp,               // 止盈价
+            ticket,           // 订单号
+            comment,           // 备注
+            timestamp          // 时间戳
+        } = req.body;
+        
+        // 打印所有收到的信息
+        console.log('操作类型:', action || '未知');
+        console.log('订单类型:', orderType || '未知');
+        console.log('交易品种:', symbol || '未知');
+        console.log('手数:', volume || '未知');
+        console.log('价格:', price || '未知');
+        if (sl) console.log('止损价:', sl);
+        if (tp) console.log('止盈价:', tp);
+        if (ticket) console.log('订单号:', ticket);
+        if (comment) console.log('备注:', comment);
+        
+        // 处理时间戳转换
+        if (timestamp) {
+            const timeResult = convertMT5TimeToUTC8(timestamp);
+            if (timeResult && !timeResult.error) {
+                console.log('EA原始时间 (MT5服务器时区 UTC+2):', timeResult.original);
+                console.log('UTC时间:', timeResult.utc);
+                console.log('UTC+8时间 (中国时区):', timeResult.utc8);
+            } else {
+                console.log('时间转换失败:', timeResult ? timeResult.error : '未知错误');
+                console.log('原始时间:', timestamp);
+            }
+        }
+        
+        // 处理时间戳转换并添加到消息对象
+        let timeResult = null;
+        if (timestamp) {
+            timeResult = convertMT5TimeToUTC8(timestamp);
+        }
+
+        // 构建完整的消息对象
+        const message = {
+            action,
+            orderType,
+            symbol,
+            volume,
+            price,
+            sl: sl || null,
+            tp: tp || null,
+            ticket: ticket || null,
+            comment: comment || null,
+            timestamp: timestamp || null,
+            timeConverted: timeResult || null,
+            receivedAt: new Date().toISOString()
+        };
+
+        // 将消息添加到队列
+        const added = messageQueue.add(message);
+        if (added) {
+            console.log('✅ 消息已添加到队列，当前队列长度:', messageQueue.size());
+        } else {
+            console.warn('⚠️  消息添加到队列失败');
+        }
+
+        // 打印完整请求体（用于调试）
+        console.log('\n完整数据:');
+        console.log(JSON.stringify(req.body, null, 2));
+        console.log('='.repeat(60) + '\n');
+        
+        res.json({
+            success: true,
+            message: '交易信息接收成功',
+            received: {
+                action: action,
+                orderType: orderType,
+                symbol: symbol,
+                volume: volume,
+                price: price
+            },
+            queueSize: messageQueue.size(),
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ 处理交易信息失败:', error);
+        console.error('错误堆栈:', error.stack);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+/**
+ * 查询消息队列接口（读取并删除最早的消息）
+ */
+app.get('/queue/read', (req, res) => {
+    try {
+        const message = messageQueue.read();
+        
+        if (message === null) {
+            // 队列为空
+            res.json({
+                success: true,
+                message: '队列为空',
+                data: null,
+                queueSize: 0
+            });
+        } else {
+            // 返回最早的消息
+            console.log('\n' + '╔' + '═'.repeat(58) + '╗');
+            console.log('║' + ' '.repeat(20) + '📤 消息读取成功' + ' '.repeat(20) + '║');
+            console.log('╠' + '═'.repeat(58) + '╣');
+            console.log('║ 操作类型: ' + (message.action || '未知').padEnd(46) + '║');
+            console.log('║ 订单类型: ' + (message.orderType || '未知').padEnd(46) + '║');
+            console.log('║ 交易品种: ' + (message.symbol || '未知').padEnd(46) + '║');
+            if (message.volume) {
+                console.log('║ 手数: ' + String(message.volume).padEnd(50) + '║');
+            }
+            if (message.price) {
+                console.log('║ 价格: ' + String(message.price).padEnd(50) + '║');
+            }
+            if (message.ticket) {
+                console.log('║ 订单号: ' + String(message.ticket).padEnd(48) + '║');
+            }
+            if (message.timeConverted && message.timeConverted.utc8) {
+                console.log('║ 时间 (UTC+8): ' + message.timeConverted.utc8.padEnd(43) + '║');
+            }
+            console.log('╠' + '═'.repeat(58) + '╣');
+            console.log('║ 队列剩余: ' + String(messageQueue.size()).padEnd(47) + '条消息 ║');
+            console.log('╚' + '═'.repeat(58) + '╝\n');
+            
+            res.json({
+                success: true,
+                message: '成功读取消息',
+                data: message,
+                queueSize: messageQueue.size()
+            });
+        }
+    } catch (error) {
+        console.error('❌ 读取队列失败:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * 查看队列统计信息（不删除消息）
+ */
+app.get('/queue/stats', (req, res) => {
+    try {
+        const stats = messageQueue.getStats();
+        res.json({
+            success: true,
+            stats: stats
+        });
+    } catch (error) {
+        console.error('❌ 获取队列统计失败:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // ==================== 错误处理 ====================
 
 app.use((err, req, res, next) => {
@@ -412,10 +608,13 @@ app.listen(CONFIG.PORT, () => {
     }
     console.log('='.repeat(60));
     console.log('\n可用端点:');
-    console.log(`  GET  /health      - 健康检查`);
-    console.log(`  POST /test        - 测试连接（不截图）`);
-    console.log(`  POST /screenshot  - 接收信号 + 截图 + 发邮件`);
-    console.log(`  POST /notify      - 仅发送邮件通知`);
+    console.log(`  GET  /health         - 健康检查`);
+    console.log(`  POST /test           - 测试连接（不截图）`);
+    console.log(`  POST /screenshot    - 接收信号 + 截图 + 发邮件`);
+    console.log(`  POST /notify         - 仅发送邮件通知`);
+    console.log(`  POST /trade          - 接收EA交易信息（开仓/平仓）`);
+    console.log(`  GET  /queue/read     - 读取队列中最早的消息（FIFO，读取后删除）`);
+    console.log(`  GET  /queue/stats    - 查看队列统计信息`);
     console.log('='.repeat(60));
     console.log('\n⚠️  重要提示:');
     console.log('1. 截图模式设置为 "window"，将仅截取 cTrader 窗口');
