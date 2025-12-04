@@ -75,7 +75,32 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
-    // 只处理成交事件
+    // 处理仓位修改事件
+    if(trans.type == TRADE_TRANSACTION_POSITION)
+    {
+        ulong positionId = trans.position;
+        if(positionId > 0 && PositionSelectByTicket(positionId))
+        {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            double sl = PositionGetDouble(POSITION_SL);
+            double tp = PositionGetDouble(POSITION_TP);
+            long ticket = (long)positionId;
+            
+            // 获取订单类型
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            string orderType = "";
+            if(posType == POSITION_TYPE_BUY)
+                orderType = "buy";
+            else if(posType == POSITION_TYPE_SELL)
+                orderType = "sell";
+            
+            // 发送修改信息到服务器
+            SendTradeInfo("modify", orderType, symbol, 0, 0, sl, tp, ticket, "");
+        }
+        return;
+    }
+    
+    // 处理成交事件（开仓/平仓）
     if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
         return;
     

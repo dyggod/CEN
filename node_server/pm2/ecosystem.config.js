@@ -1,11 +1,13 @@
 // PM2 配置文件
 // 用法：pm2 start ecosystem.config.js
 
+const path = require('path');
+
 module.exports = {
   apps: [{
     name: 'EA&CTrader-Webhook',
-    script: '../server.js',
-    cwd: '..',
+    script: path.join(__dirname, '../server.js'),
+    cwd: path.join(__dirname, '..'),
     
     // 实例数量
     instances: 1,
@@ -26,8 +28,8 @@ module.exports = {
     },
     
     // 日志配置
-    error_file: '../logs/error.log',
-    out_file: '../logs/output.log',
+    error_file: path.join(__dirname, '../logs/error.log'),
+    out_file: path.join(__dirname, '../logs/output.log'),
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     
     // 合并日志

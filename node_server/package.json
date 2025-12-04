@@ -6,14 +6,14 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "pm2:start": "pm2 start ecosystem.config.js",
-    "pm2:stop": "pm2 stop keltner-webhook",
-    "pm2:restart": "pm2 restart keltner-webhook",
-    "pm2:delete": "pm2 delete keltner-webhook",
-    "pm2:logs": "pm2 logs keltner-webhook",
-    "pm2:status": "pm2 status",
-    "pm2:startup": "pm2 startup",
-    "pm2:save": "pm2 save"
+    "pm2:start": "node node_modules/pm2/bin/pm2 start pm2/ecosystem.config.js",
+    "pm2:stop": "node node_modules/pm2/bin/pm2 stop \"EA&CTrader-Webhook\"",
+    "pm2:restart": "node node_modules/pm2/bin/pm2 restart \"EA&CTrader-Webhook\"",
+    "pm2:delete": "node node_modules/pm2/bin/pm2 delete \"EA&CTrader-Webhook\"",
+    "pm2:logs": "node node_modules/pm2/bin/pm2 logs \"EA&CTrader-Webhook\"",
+    "pm2:status": "node node_modules/pm2/bin/pm2 status",
+    "pm2:startup": "node node_modules/pm2/bin/pm2 startup",
+    "pm2:save": "node node_modules/pm2/bin/pm2 save"
   },
   "keywords": [
     "ctrader",

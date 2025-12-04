@@ -96,21 +96,7 @@ namespace cAlgo.Robots
                 // 检查是否包含"data":null（队列为空）
                 if (jsonResponse.Contains("\"data\":null") || jsonResponse.Contains("\"data\": null"))
                 {
-                    Print("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] 队列为空");
-                    
-                    // 提取队列大小
-                    int queueSizeIndex = jsonResponse.IndexOf("\"queueSize\":");
-                    if (queueSizeIndex >= 0)
-                    {
-                        int start = queueSizeIndex + 12;
-                        int end = jsonResponse.IndexOf(",", start);
-                        if (end < 0) end = jsonResponse.IndexOf("}", start);
-                        if (end > start)
-                        {
-                            string queueSizeStr = jsonResponse.Substring(start, end - start).Trim();
-                            Print("队列剩余: " + queueSizeStr + " 条消息");
-                        }
-                    }
+                    // 队列为空，不打印日志，直接返回
                     return;
                 }
 
@@ -304,6 +290,10 @@ namespace cAlgo.Robots
                 {
                     ExecuteClosePosition(message);
                 }
+                else if (message.Action == "modify")
+                {
+                    ExecuteModifyPosition(message);
+                }
                 else
                 {
                     Print("⚠️  未知的操作类型: " + message.Action);
@@ -474,6 +464,91 @@ namespace cAlgo.Robots
             {
                 _tradeSuccessCount++;
                 Print("✅ 已平仓 " + closedCount + " 个持仓");
+            }
+        }
+
+        /// <summary>
+        /// 执行修改仓位操作（修改止盈/止损）
+        /// </summary>
+        private void ExecuteModifyPosition(MessageData message)
+        {
+            try
+            {
+                if (!message.Ticket.HasValue || message.Ticket.Value <= 0)
+                {
+                    Print("⚠️  修改仓位消息缺少订单号");
+                    _tradeFailCount++;
+                    return;
+                }
+
+                // 根据订单号查找持仓
+                Position position = null;
+                
+                // 先尝试通过订单号查找
+                foreach (var pos in Positions)
+                {
+                    if (pos.Id == message.Ticket.Value)
+                    {
+                        position = pos;
+                        break;
+                    }
+                }
+                
+                // 如果没找到，尝试通过标签和品种查找
+                if (position == null)
+                {
+                    position = Positions.Find("QueueBot", message.Symbol, TradeType.Buy);
+                    if (position == null)
+                        position = Positions.Find("QueueBot", message.Symbol, TradeType.Sell);
+                }
+
+                if (position != null)
+                {
+                    // 准备新的TP/SL值
+                    double? newTP = message.TP.HasValue && message.TP.Value > 0 ? message.TP.Value : (double?)null;
+                    double? newSL = message.SL.HasValue && message.SL.Value > 0 ? message.SL.Value : (double?)null;
+                    
+                    // 如果TP和SL都没有值，则跳过
+                    if (!newTP.HasValue && !newSL.HasValue)
+                    {
+                        Print("⚠️  修改仓位消息中没有有效的止盈/止损值");
+                        return;
+                    }
+                    
+                    Print("   正在修改仓位止盈/止损...");
+                    if (newTP.HasValue)
+                        Print("   新止盈: " + newTP.Value);
+                    if (newSL.HasValue)
+                        Print("   新止损: " + newSL.Value);
+                    
+                    // 使用新的 ModifyPosition 方法（带 ProtectionType 参数）
+                    var modifyResult = ModifyPosition(position, newSL, newTP, ProtectionType.Absolute);
+                    
+                    if (modifyResult.IsSuccessful)
+                    {
+                        _tradeSuccessCount++;
+                        Print("✅ 仓位修改成功: 订单号 " + message.Ticket.Value);
+                        if (newTP.HasValue)
+                            Print("   止盈: " + newTP.Value);
+                        if (newSL.HasValue)
+                            Print("   止损: " + newSL.Value);
+                    }
+                    else
+                    {
+                        _tradeFailCount++;
+                        string errorMsg = modifyResult.Error.HasValue ? modifyResult.Error.Value.ToString() : "未知错误";
+                        Print("❌ 仓位修改失败: " + errorMsg);
+                    }
+                }
+                else
+                {
+                    Print("⚠️  未找到订单号 " + message.Ticket.Value + " 的持仓");
+                }
+            }
+            catch (Exception ex)
+            {
+                _tradeFailCount++;
+                Print("❌ 修改仓位异常: " + ex.Message);
             }
         }
 
