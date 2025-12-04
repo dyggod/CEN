@@ -1,0 +1,39 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 截图文件
+screenshots/*.png
+screenshots/*.jpg
+screenshots/*.jpeg
+
+# 但保留目录
+!screenshots/.gitkeep
+
+# 日志
+*.log
+logs/*.log
+
+# 但保留目录
+!logs/.gitkeep
+
+# PM2
+.pm2/
+pids/
+*.pid
+*.seed
+
+# 环境配置
+.env
+.env.local
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
