@@ -13,7 +13,8 @@
     "pm2:logs": "node node_modules/pm2/bin/pm2 logs \"EA&CTrader-Webhook\"",
     "pm2:status": "node node_modules/pm2/bin/pm2 status",
     "pm2:startup": "node node_modules/pm2/bin/pm2 startup",
-    "pm2:save": "node node_modules/pm2/bin/pm2 save"
+    "pm2:save": "node node_modules/pm2/bin/pm2 save",
+    "logs:clear": "node scripts/clear-logs.js"
   },
   "keywords": [
     "ctrader",
