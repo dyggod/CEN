@@ -18,6 +18,9 @@ namespace cAlgo.Robots
         [Parameter("消息过期时间（秒）", DefaultValue = 5, MinValue = 1)]
         public int MessageExpireSeconds { get; set; }
 
+        [Parameter("固定手数", DefaultValue = 0, MinValue = 0)]
+        public double FixedVolume { get; set; }
+
         // 私有变量
         private HttpClient _httpClient;
         private int _requestCount = 0;
@@ -41,6 +44,10 @@ namespace cAlgo.Robots
             Print("服务器地址: " + ServerURL);
             Print("请求间隔: " + RequestInterval + " 秒");
             Print("消息过期时间: " + MessageExpireSeconds + " 秒");
+            if (FixedVolume > 0)
+                Print("固定手数: " + FixedVolume + " 手（将忽略消息中的手数）");
+            else
+                Print("手数模式: 跟随消息中的手数");
         }
 
         protected override void OnTimer()
@@ -335,8 +342,11 @@ namespace cAlgo.Robots
                     return;
                 }
 
+                // 确定使用的手数：如果设置了固定手数，则使用固定手数；否则使用消息中的手数
+                double volumeToUse = FixedVolume > 0 ? FixedVolume : message.Volume;
+                
                 // 计算手数（转换为cTrader的单位，手数转为基础单位）
-                double volumeInUnits = symbol.QuantityToVolumeInUnits(message.Volume);
+                double volumeInUnits = symbol.QuantityToVolumeInUnits(volumeToUse);
 
                 // 先执行开仓（不设置TP/SL，因为可能不准确）
                 var result = ExecuteMarketOrder(tradeType, symbol.Name, volumeInUnits, "QueueBot");
@@ -344,7 +354,10 @@ namespace cAlgo.Robots
                 if (result.IsSuccessful && result.Position != null)
                 {
                     _tradeSuccessCount++;
-                    Print("✅ 开仓成功: " + tradeType + " " + message.Symbol + " " + message.Volume + "手");
+                    string volumeInfo = FixedVolume > 0 
+                        ? volumeToUse + "手（固定手数，消息中为" + message.Volume + "手）" 
+                        : volumeToUse + "手";
+                    Print("✅ 开仓成功: " + tradeType + " " + message.Symbol + " " + volumeInfo);
                     Print("   订单号: " + result.Position.Id);
                     
                     // 开仓成功后，立即修改TP/SL为正确值
