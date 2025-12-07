@@ -15,6 +15,7 @@ input int      RequestInterval = 1;                          // 请求间隔（�
 int requestCount = 0;  // 请求计数
 int successCount = 0;  // 成功计数
 int failCount = 0;     // 失败计数
+ulong processedDeals[];  // 已处理的成交单列表（用于去重）
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -22,7 +23,9 @@ int failCount = 0;     // 失败计数
 int OnInit()
 {
     EventSetTimer(RequestInterval);
+    long accountId = AccountInfoInteger(ACCOUNT_LOGIN);
     Print("Health Check EA 已启动 - ", ServerURL);
+    Print("当前账户ID: ", accountId);
     return(INIT_SUCCEEDED);
 }
 
@@ -109,6 +112,17 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     if(dealTicket == 0)
         return;
     
+    // 检查是否已经处理过这个成交单（去重）
+    int dealCount = ArraySize(processedDeals);
+    for(int i = 0; i < dealCount; i++)
+    {
+        if(processedDeals[i] == dealTicket)
+        {
+            // 已经处理过，跳过
+            return;
+        }
+    }
+    
     if(!HistoryDealSelect(dealTicket))
         return;
     
@@ -150,6 +164,22 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     // 获取备注信息
     string comment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
     
+    // 记录已处理的成交单（添加到数组）
+    ArrayResize(processedDeals, dealCount + 1);
+    processedDeals[dealCount] = dealTicket;
+    
+    // 限制数组大小，防止内存溢出（保留最近1000条记录）
+    if(ArraySize(processedDeals) > 1000)
+    {
+        // 移除最旧的记录（保留最新的1000条）
+        int removeCount = ArraySize(processedDeals) - 1000;
+        for(int i = 0; i < 1000; i++)
+        {
+            processedDeals[i] = processedDeals[i + removeCount];
+        }
+        ArrayResize(processedDeals, 1000);
+    }
+    
     // 发送交易信息到服务器
     SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)dealTicket, comment);
 }
@@ -161,8 +191,12 @@ void SendTradeInfo(string action, string orderType, string symbol,
                    double volume, double price, double sl, double tp, 
                    long ticket, string comment)
 {
+    // 获取账户ID
+    long accountId = AccountInfoInteger(ACCOUNT_LOGIN);
+    
     // 构建JSON数据
     string json = "{";
+    json += "\"accountId\":" + IntegerToString(accountId) + ",";
     json += "\"action\":\"" + action + "\",";
     json += "\"orderType\":\"" + orderType + "\",";
     json += "\"symbol\":\"" + symbol + "\",";

@@ -38,7 +38,28 @@ const CONFIG = {
     SCREENSHOT_DELAY: 500,
     
     // 临时文件保留时间（毫秒）
-    TEMP_FILE_RETENTION: 10000
+    TEMP_FILE_RETENTION: 10000,
+    
+    // 允许的账户ID列表
+    ALLOWED_ACCOUNTS: {
+        // MT5 账户ID列表（用于 trade 接口）
+        MT5: [
+            '7412666', // 真实
+            '52615313' // 模拟
+        ],
+        // cTrader 账户ID列表（用于 queue/read 接口）
+        CTRADER: [
+            '6098214', // 真实
+            '9694550' // 模拟
+        ]
+    },
+    // 账户对应关系：指定哪个 cTrader 账户可以消费哪个 MT5 账户推送的消息
+    // 格式：{ cTrader账户ID: [MT5账户ID1, MT5账户ID2, ...] }
+    ACCOUNT_MAPPING: {
+        // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
+        '6098214': ['7412666'], // 真实
+        '9694550': ['52615313'] // 模拟
+    }
 };
 
 // ==================== 初始化 ====================
@@ -393,24 +414,9 @@ app.post('/notify', async (req, res) => {
  */
 app.post('/trade', async (req, res) => {
     try {
-        console.log('\n' + '='.repeat(60));
-        console.log('📊 收到交易信息');
-        const serverTime = new Date();
-        console.log('服务器当前时间 (UTC):', serverTime.toISOString());
-        console.log('服务器当前时间 (UTC+8):', serverTime.toLocaleString('zh-CN', {
-            timeZone: 'Asia/Shanghai',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false
-        }));
-        console.log('='.repeat(60));
-        
         // 解析请求数据
         const {
+            accountId,        // 账户ID（必需）
             action,           // 操作类型：'open' 开仓 / 'close' 平仓
             orderType,        // 订单类型：'buy' / 'sell'
             symbol,           // 交易品种
@@ -423,38 +429,38 @@ app.post('/trade', async (req, res) => {
             timestamp          // 时间戳
         } = req.body;
         
-        // 打印所有收到的信息
-        console.log('操作类型:', action || '未知');
-        console.log('订单类型:', orderType || '未知');
-        console.log('交易品种:', symbol || '未知');
-        console.log('手数:', volume || '未知');
-        console.log('价格:', price || '未知');
-        if (sl) console.log('止损价:', sl);
-        if (tp) console.log('止盈价:', tp);
-        if (ticket) console.log('订单号:', ticket);
-        if (comment) console.log('备注:', comment);
-        
-        // 处理时间戳转换
-        if (timestamp) {
-            const timeResult = convertMT5TimeToUTC8(timestamp);
-            if (timeResult && !timeResult.error) {
-                console.log('EA原始时间 (MT5服务器时区 UTC+2):', timeResult.original);
-                console.log('UTC时间:', timeResult.utc);
-                console.log('UTC+8时间 (中国时区):', timeResult.utc8);
-            } else {
-                console.log('时间转换失败:', timeResult ? timeResult.error : '未知错误');
-                console.log('原始时间:', timestamp);
-            }
+        // 验证账户ID
+        if (!accountId) {
+            console.log('❌ 缺少账户ID参数');
+            return res.status(400).json({
+                success: false,
+                error: '缺少账户ID参数',
+                message: '请求中必须包含 accountId 字段'
+            });
         }
         
-        // 处理时间戳转换并添加到消息对象
+        // 检查账户ID是否在允许列表中
+        const accountIdStr = String(accountId);
+        if (CONFIG.ALLOWED_ACCOUNTS.MT5.length > 0 && !CONFIG.ALLOWED_ACCOUNTS.MT5.includes(accountIdStr)) {
+            console.log('❌ 账户ID不在允许范围内:', accountIdStr);
+            console.log('允许的MT5账户ID列表:', CONFIG.ALLOWED_ACCOUNTS.MT5);
+            return res.status(403).json({
+                success: false,
+                error: '账户ID不在允许范围内',
+                message: `账户ID ${accountIdStr} 不在允许的MT5账户列表中`,
+                accountId: accountIdStr
+            });
+        }
+        
+        // 处理时间戳转换
         let timeResult = null;
         if (timestamp) {
             timeResult = convertMT5TimeToUTC8(timestamp);
         }
 
-        // 构建完整的消息对象
+        // 构建完整的消息对象（包含账户ID）
         const message = {
+            accountId: accountIdStr,  // MT5 账户ID
             action,
             orderType,
             symbol,
@@ -469,30 +475,29 @@ app.post('/trade', async (req, res) => {
             receivedAt: new Date().toISOString()
         };
 
-        // 将消息添加到队列
+        // 将消息添加到队列（按 MT5 账户ID 分组）
         const added = messageQueue.add(message);
         if (added) {
-            console.log('✅ 消息已添加到队列，当前队列长度:', messageQueue.size());
+            const queueSize = messageQueue.size(accountIdStr);
+            // 只打印重要信息：操作类型、品种、手数、价格
+            console.log(`📊 [MT5:${accountIdStr}] ${action.toUpperCase()} ${orderType} ${symbol} ${volume}手 @ ${price} | 队列:${queueSize}`);
         } else {
             console.warn('⚠️  消息添加到队列失败');
         }
-
-        // 打印完整请求体（用于调试）
-        console.log('\n完整数据:');
-        console.log(JSON.stringify(req.body, null, 2));
-        console.log('='.repeat(60) + '\n');
         
         res.json({
             success: true,
             message: '交易信息接收成功',
             received: {
+                accountId: accountIdStr,
                 action: action,
                 orderType: orderType,
                 symbol: symbol,
                 volume: volume,
                 price: price
             },
-            queueSize: messageQueue.size(),
+            queueSize: messageQueue.size(accountIdStr),
+            mt5AccountId: accountIdStr,
             timestamp: new Date().toISOString()
         });
         
@@ -513,21 +518,65 @@ app.post('/trade', async (req, res) => {
  */
 app.get('/queue/read', (req, res) => {
     try {
-        const message = messageQueue.read();
+        // 获取账户ID（从查询参数）
+        const accountId = req.query.accountId || req.query.account_id;
+        
+        // 验证账户ID
+        if (!accountId) {
+            console.log('❌ 缺少账户ID参数');
+            return res.status(400).json({
+                success: false,
+                error: '缺少账户ID参数',
+                message: '请求中必须包含 accountId 查询参数（例如：/queue/read?accountId=12345678）'
+            });
+        }
+        
+        // 检查账户ID是否在允许列表中
+        const accountIdStr = String(accountId);
+        if (CONFIG.ALLOWED_ACCOUNTS.CTRADER.length > 0 && !CONFIG.ALLOWED_ACCOUNTS.CTRADER.includes(accountIdStr)) {
+            console.log('❌ 账户ID不在允许范围内:', accountIdStr);
+            console.log('允许的cTrader账户ID列表:', CONFIG.ALLOWED_ACCOUNTS.CTRADER);
+            return res.status(403).json({
+                success: false,
+                error: '账户ID不在允许范围内',
+                message: `账户ID ${accountIdStr} 不在允许的cTrader账户列表中`,
+                accountId: accountIdStr
+            });
+        }
+        
+        // 查找该 cTrader 账户可以读取的 MT5 账户列表
+        const allowedMT5Accounts = CONFIG.ACCOUNT_MAPPING[accountIdStr];
+        
+        if (!allowedMT5Accounts || !Array.isArray(allowedMT5Accounts) || allowedMT5Accounts.length === 0) {
+            console.log('⚠️  cTrader账户 ' + accountIdStr + ' 没有配置允许读取的MT5账户');
+            return res.status(403).json({
+                success: false,
+                error: '账户对应关系未配置',
+                message: `cTrader账户 ${accountIdStr} 没有配置允许读取的MT5账户，请在 CONFIG.ACCOUNT_MAPPING 中配置`,
+                accountId: accountIdStr
+            });
+        }
+        
+        // 从允许的 MT5 账户队列中读取消息（按优先级顺序）
+        const message = messageQueue.readFromAccounts(allowedMT5Accounts);
         
         if (message === null) {
-            // 队列为空
+            // 所有允许的队列都为空
+            const totalQueueSize = messageQueue.sizeFromAccounts(allowedMT5Accounts);
             res.json({
                 success: true,
                 message: '队列为空',
                 data: null,
-                queueSize: 0
+                queueSize: totalQueueSize,
+                allowedMT5Accounts: allowedMT5Accounts
             });
         } else {
             // 返回最早的消息
+            const messageMT5Account = message.accountId || '未知';
             console.log('\n' + '╔' + '═'.repeat(58) + '╗');
             console.log('║' + ' '.repeat(20) + '📤 消息读取成功' + ' '.repeat(20) + '║');
             console.log('╠' + '═'.repeat(58) + '╣');
+            console.log('║ MT5账户ID: ' + String(messageMT5Account).padEnd(46) + '║');
             console.log('║ 操作类型: ' + (message.action || '未知').padEnd(46) + '║');
             console.log('║ 订单类型: ' + (message.orderType || '未知').padEnd(46) + '║');
             console.log('║ 交易品种: ' + (message.symbol || '未知').padEnd(46) + '║');
@@ -544,14 +593,19 @@ app.get('/queue/read', (req, res) => {
                 console.log('║ 时间 (UTC+8): ' + message.timeConverted.utc8.padEnd(43) + '║');
             }
             console.log('╠' + '═'.repeat(58) + '╣');
-            console.log('║ 队列剩余: ' + String(messageQueue.size()).padEnd(47) + '条消息 ║');
+            
+            // 计算剩余队列大小
+            const totalQueueSize = messageQueue.sizeFromAccounts(allowedMT5Accounts);
+            console.log('║ 队列剩余: ' + String(totalQueueSize).padEnd(47) + '条消息 ║');
             console.log('╚' + '═'.repeat(58) + '╝\n');
             
             res.json({
                 success: true,
                 message: '成功读取消息',
                 data: message,
-                queueSize: messageQueue.size()
+                queueSize: totalQueueSize,
+                mt5AccountId: messageMT5Account,
+                allowedMT5Accounts: allowedMT5Accounts
             });
         }
     } catch (error) {
@@ -565,13 +619,16 @@ app.get('/queue/read', (req, res) => {
 
 /**
  * 查看队列统计信息（不删除消息）
+ * 支持查询参数 accountId 来查看特定 MT5 账户的统计
  */
 app.get('/queue/stats', (req, res) => {
     try {
-        const stats = messageQueue.getStats();
+        const mt5AccountId = req.query.accountId || req.query.account_id || null;
+        const stats = messageQueue.getStats(mt5AccountId);
         res.json({
             success: true,
-            stats: stats
+            stats: stats,
+            mt5AccountId: mt5AccountId || 'all'
         });
     } catch (error) {
         console.error('❌ 获取队列统计失败:', error);
@@ -607,19 +664,41 @@ app.listen(CONFIG.PORT, () => {
         console.log(`🪟 窗口标题: ${CONFIG.CTRADER_WINDOW_TITLE}`);
     }
     console.log('='.repeat(60));
+    console.log('\n🔐 账户ID验证配置:');
+    if (CONFIG.ALLOWED_ACCOUNTS.MT5.length > 0) {
+        console.log(`  ✅ MT5账户列表: ${CONFIG.ALLOWED_ACCOUNTS.MT5.join(', ')}`);
+    } else {
+        console.log(`  ⚠️  MT5账户列表: 未配置（允许所有账户）`);
+    }
+    if (CONFIG.ALLOWED_ACCOUNTS.CTRADER.length > 0) {
+        console.log(`  ✅ cTrader账户列表: ${CONFIG.ALLOWED_ACCOUNTS.CTRADER.join(', ')}`);
+    } else {
+        console.log(`  ⚠️  cTrader账户列表: 未配置（允许所有账户）`);
+    }
+    console.log('\n📋 账户对应关系（cTrader → MT5）:');
+    const mappingCount = Object.keys(CONFIG.ACCOUNT_MAPPING).length;
+    if (mappingCount > 0) {
+        for (const [ctraderId, mt5Ids] of Object.entries(CONFIG.ACCOUNT_MAPPING)) {
+            console.log(`  ✅ cTrader ${ctraderId} → MT5 [${mt5Ids.join(', ')}]`);
+        }
+    } else {
+        console.log(`  ⚠️  未配置账户对应关系（需要在 CONFIG.ACCOUNT_MAPPING 中配置）`);
+    }
+    console.log('='.repeat(60));
     console.log('\n可用端点:');
     console.log(`  GET  /health         - 健康检查`);
     console.log(`  POST /test           - 测试连接（不截图）`);
     console.log(`  POST /screenshot    - 接收信号 + 截图 + 发邮件`);
     console.log(`  POST /notify         - 仅发送邮件通知`);
-    console.log(`  POST /trade          - 接收EA交易信息（开仓/平仓）`);
-    console.log(`  GET  /queue/read     - 读取队列中最早的消息（FIFO，读取后删除）`);
+    console.log(`  POST /trade          - 接收EA交易信息（开仓/平仓）[需要 accountId]`);
+    console.log(`  GET  /queue/read     - 读取队列中最早的消息（FIFO，读取后删除）[需要 accountId]`);
     console.log(`  GET  /queue/stats    - 查看队列统计信息`);
     console.log('='.repeat(60));
     console.log('\n⚠️  重要提示:');
     console.log('1. 截图模式设置为 "window"，将仅截取 cTrader 窗口');
     console.log('2. 确保 cTrader 窗口可见（不要最小化）');
-    console.log('3. 按 Ctrl+C 停止服务器');
+    console.log('3. 在 server.js 的 CONFIG.ALLOWED_ACCOUNTS 中配置允许的账户ID');
+    console.log('4. 按 Ctrl+C 停止服务器');
     console.log('='.repeat(60) + '\n');
     console.log('等待信号中...\n');
 });

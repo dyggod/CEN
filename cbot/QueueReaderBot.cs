@@ -23,6 +23,7 @@ namespace cAlgo.Robots
 
         // 私有变量
         private HttpClient _httpClient;
+        private long _accountId = 0;  // 账户ID（在主线程中获取）
         private int _requestCount = 0;
         private int _successCount = 0;
         private int _failCount = 0;
@@ -33,6 +34,9 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
+            // 在主线程中获取账户ID（必须在主线程中访问 Account.Number）
+            _accountId = Account.Number;
+            
             // 初始化HTTP客户端
             _httpClient = new HttpClient();
             _httpClient.Timeout = TimeSpan.FromSeconds(5);
@@ -42,6 +46,7 @@ namespace cAlgo.Robots
 
             Print("Queue Reader Bot 已启动");
             Print("服务器地址: " + ServerURL);
+            Print("当前账户ID: " + _accountId);
             Print("请求间隔: " + RequestInterval + " 秒");
             Print("消息过期时间: " + MessageExpireSeconds + " 秒");
             if (FixedVolume > 0)
@@ -67,8 +72,19 @@ namespace cAlgo.Robots
 
             try
             {
+                // 构建带账户ID的URL（使用预先获取的账户ID，避免在后台线程访问 Account.Number）
+                string urlWithAccountId = ServerURL;
+                if (ServerURL.Contains("?"))
+                {
+                    urlWithAccountId += "&accountId=" + _accountId;
+                }
+                else
+                {
+                    urlWithAccountId += "?accountId=" + _accountId;
+                }
+                
                 // 发送GET请求
-                HttpResponseMessage response = await _httpClient.GetAsync(ServerURL);
+                HttpResponseMessage response = await _httpClient.GetAsync(urlWithAccountId);
                 response.EnsureSuccessStatusCode();
                 
                 // 读取响应内容
