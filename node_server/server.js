@@ -57,8 +57,8 @@ const CONFIG = {
     // 格式：{ cTrader账户ID: [MT5账户ID1, MT5账户ID2, ...] }
     ACCOUNT_MAPPING: {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
-        '6098214': ['7412666'], // 真实
-        '9694550': ['52615313'] // 模拟
+        '6098214': ['7412666'], // 真实 ctrader > 真实mt5
+        '9694550': ['52615313'] // 模拟 ctrader > 模拟mt5
     }
 };
 
@@ -92,6 +92,22 @@ try {
 } catch (error) {
     console.error('❌ 邮件服务配置失败:', error.message);
 }
+
+// ==================== 仓位信息存储 ====================
+// 存储格式: { accountId: { total: number, buy: number, sell: number, lastUpdate: timestamp } }
+const positionData = {
+    // MT5 (EA) 仓位信息
+    mt5: {},
+    // cTrader 仓位信息
+    ctrader: {}
+};
+
+// ==================== 邮件发送频率控制 ====================
+// 记录每个账户对的上次发送邮件时间
+// 格式: { "ctraderAccountId_mt5AccountId": timestamp }
+const lastEmailSentTime = {};
+// 最小发送间隔（毫秒），默认2分钟
+const EMAIL_NOTIFY_INTERVAL = 2 * 60 * 1000; // 5分钟
 
 // ==================== 工具函数 ====================
 
@@ -190,6 +206,161 @@ async function takeScreenshot(tempFilePath = null) {
         }
         
         throw error;
+    }
+}
+
+/**
+ * 比较仓位信息并发送通知（如果不匹配）
+ */
+async function compareAndNotifyPositions(ctraderAccountId, ctraderPos) {
+    try {
+        // 查找该 cTrader 账户对应的 MT5 账户列表
+        const allowedMT5Accounts = CONFIG.ACCOUNT_MAPPING[ctraderAccountId];
+        
+        if (!allowedMT5Accounts || !Array.isArray(allowedMT5Accounts) || allowedMT5Accounts.length === 0) {
+            // 没有配置对应关系，跳过比较
+            return;
+        }
+        
+        // 保存 cTrader 仓位信息
+        positionData.ctrader[ctraderAccountId] = {
+            total: ctraderPos.total || 0,
+            buy: ctraderPos.buy || 0,
+            sell: ctraderPos.sell || 0,
+            lastUpdate: new Date().toISOString()
+        };
+        
+        // 汇总所有对应的 MT5 账户的仓位信息
+        let mt5TotalSum = 0;
+        let mt5BuySum = 0;
+        let mt5SellSum = 0;
+        const mt5AccountDetails = []; // 记录每个 MT5 账户的详细信息
+        let hasMT5Data = false;
+        
+        for (const mt5AccountId of allowedMT5Accounts) {
+            const mt5Pos = positionData.mt5[mt5AccountId];
+            
+            if (mt5Pos) {
+                hasMT5Data = true;
+                mt5TotalSum += mt5Pos.total || 0;
+                mt5BuySum += mt5Pos.buy || 0;
+                mt5SellSum += mt5Pos.sell || 0;
+                mt5AccountDetails.push({
+                    accountId: mt5AccountId,
+                    total: mt5Pos.total || 0,
+                    buy: mt5Pos.buy || 0,
+                    sell: mt5Pos.sell || 0,
+                    lastUpdate: mt5Pos.lastUpdate
+                });
+            }
+        }
+        
+        // 如果没有任何 MT5 账户上报仓位信息，跳过比较
+        if (!hasMT5Data) {
+            return;
+        }
+        
+        // 比较汇总后的仓位数量
+        const ctraderTotal = ctraderPos.total || 0;
+        const ctraderBuy = ctraderPos.buy || 0;
+        const ctraderSell = ctraderPos.sell || 0;
+        
+        // 检查是否不匹配
+        if (ctraderTotal !== mt5TotalSum || ctraderBuy !== mt5BuySum || ctraderSell !== mt5SellSum) {
+            // 生成账户对的唯一标识（使用所有 MT5 账户ID的组合）
+            const mt5AccountsKey = allowedMT5Accounts.join('_');
+            const accountPairKey = `${ctraderAccountId}_${mt5AccountsKey}`;
+            const now = Date.now();
+            const lastSentTime = lastEmailSentTime[accountPairKey] || 0;
+            const timeSinceLastEmail = now - lastSentTime;
+            
+            // 判断是否需要发送邮件
+            // 1. 第一次检测到不匹配（lastSentTime === 0）：立即发送
+            // 2. 后续持续不匹配：需要间隔至少 EMAIL_NOTIFY_INTERVAL 才发送
+            const shouldSendEmail = lastSentTime === 0 || timeSinceLastEmail >= EMAIL_NOTIFY_INTERVAL;
+            
+            if (shouldSendEmail) {
+                // 构建 MT5 账户详情文本
+                let mt5DetailsText = '';
+                for (const detail of mt5AccountDetails) {
+                    mt5DetailsText += `
+MT5 账户: ${detail.accountId}
+  - 总仓位: ${detail.total}
+  - 多单: ${detail.buy}
+  - 空单: ${detail.sell}
+  - 最后更新: ${detail.lastUpdate}`;
+                }
+                
+                // 发送邮件通知
+                const emailSubject = `[仓位不匹配警告] cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`;
+                const emailBody = `
+⚠️  仓位数量不匹配！
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 仓位对比信息
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+cTrader 账户: ${ctraderAccountId}
+  - 总仓位: ${ctraderTotal}
+  - 多单: ${ctraderBuy}
+  - 空单: ${ctraderSell}
+  - 最后更新: ${positionData.ctrader[ctraderAccountId].lastUpdate}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MT5 账户汇总（${allowedMT5Accounts.length} 个账户）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${mt5DetailsText}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 MT5 汇总统计
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - 总仓位: ${mt5TotalSum}
+  - 多单: ${mt5BuySum}
+  - 空单: ${mt5SellSum}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 差异分析
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+总仓位差异: ${ctraderTotal - mt5TotalSum > 0 ? '+' : ''}${ctraderTotal - mt5TotalSum}
+多单差异: ${ctraderBuy - mt5BuySum > 0 ? '+' : ''}${ctraderBuy - mt5BuySum}
+空单差异: ${ctraderSell - mt5SellSum > 0 ? '+' : ''}${ctraderSell - mt5SellSum}
+
+${ctraderTotal > 0 && mt5TotalSum === 0 ? '⚠️  警告: cTrader 有仓位但所有 MT5 EA 已空仓！' : ''}
+${ctraderTotal === 0 && mt5TotalSum > 0 ? '⚠️  警告: MT5 EA 有仓位但 cTrader 已空仓！' : ''}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⏰ 检测时间
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${new Date().toLocaleString('zh-CN')}
+
+${lastSentTime > 0 ? `\n📌 注：上次通知时间: ${new Date(lastSentTime).toLocaleString('zh-CN')}\n` : ''}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                `.trim();
+                
+                try {
+                    await sendEmail(emailSubject, emailBody, null, null);
+                    // 更新上次发送时间
+                    lastEmailSentTime[accountPairKey] = now;
+                    console.log(`⚠️  仓位不匹配，已发送邮件通知: cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`);
+                } catch (emailError) {
+                    console.error('❌ 发送仓位不匹配邮件失败:', emailError.message);
+                }
+            } else {
+                // 不发送邮件，但记录日志（降低频率）
+                const remainingTime = Math.ceil((EMAIL_NOTIFY_INTERVAL - timeSinceLastEmail) / 1000);
+                console.log(`⚠️  仓位不匹配（已抑制邮件，还需等待 ${remainingTime} 秒）: cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`);
+            }
+        } else {
+            // 仓位匹配，清除该账户对的发送记录（下次不匹配时立即发送）
+            const mt5AccountsKey = allowedMT5Accounts.join('_');
+            const accountPairKey = `${ctraderAccountId}_${mt5AccountsKey}`;
+            if (lastEmailSentTime[accountPairKey]) {
+                delete lastEmailSentTime[accountPairKey];
+            }
+        }
+    } catch (error) {
+        console.error('❌ 比较仓位信息失败:', error.message);
     }
 }
 
@@ -514,6 +685,83 @@ app.post('/trade', async (req, res) => {
 });
 
 /**
+ * EA上报仓位接口
+ * 接收EA上报的仓位信息：总仓位、空单仓位、多单仓位
+ */
+app.post('/position/report', async (req, res) => {
+    try {
+        // 解析请求数据
+        const {
+            accountId,        // 账户ID（必需）
+            total,            // 总仓位数量
+            buy,              // 多单仓位数量
+            sell              // 空单仓位数量
+        } = req.body;
+        
+        // 验证账户ID
+        if (!accountId) {
+            console.log('❌ 缺少账户ID参数');
+            return res.status(400).json({
+                success: false,
+                error: '缺少账户ID参数',
+                message: '请求中必须包含 accountId 字段'
+            });
+        }
+        
+        // 检查账户ID是否在允许列表中
+        const accountIdStr = String(accountId);
+        if (CONFIG.ALLOWED_ACCOUNTS.MT5.length > 0 && !CONFIG.ALLOWED_ACCOUNTS.MT5.includes(accountIdStr)) {
+            console.log('❌ 账户ID不在允许范围内:', accountIdStr);
+            return res.status(403).json({
+                success: false,
+                error: '账户ID不在允许范围内',
+                message: `账户ID ${accountIdStr} 不在允许的MT5账户列表中`,
+                accountId: accountIdStr
+            });
+        }
+        
+        // 验证仓位数据
+        const totalPos = parseInt(total) || 0;
+        const buyPos = parseInt(buy) || 0;
+        const sellPos = parseInt(sell) || 0;
+        
+        // 保存仓位信息
+        positionData.mt5[accountIdStr] = {
+            total: totalPos,
+            buy: buyPos,
+            sell: sellPos,
+            lastUpdate: new Date().toISOString()
+        };
+        
+        console.log(`📊 [MT5:${accountIdStr}] 仓位上报 - 总:${totalPos} 多:${buyPos} 空:${sellPos}`);
+        
+        res.json({
+            success: true,
+            message: '仓位信息接收成功',
+            accountId: accountIdStr,
+            position: {
+                total: totalPos,
+                buy: buyPos,
+                sell: sellPos
+            },
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ 处理仓位信息失败:', error);
+        console.error('错误堆栈:', error.stack);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+
+
+/**
  * 查询消息队列接口（读取并删除最早的消息）
  */
 app.get('/queue/read', (req, res) => {
@@ -541,6 +789,44 @@ app.get('/queue/read', (req, res) => {
                 error: '账户ID不在允许范围内',
                 message: `账户ID ${accountIdStr} 不在允许的cTrader账户列表中`,
                 accountId: accountIdStr
+            });
+        }
+        
+        // 接收 cTrader 仓位信息（从查询参数）
+        // 注意：不能使用 || null，因为 0 是 falsy，会导致仓位为 0 时被误判为 null
+        // 应该检查参数是否存在，而不是依赖 || 运算符
+        let ctraderTotal = null;
+        let ctraderBuy = null;
+        let ctraderSell = null;
+        
+        if (req.query.total !== undefined) {
+            ctraderTotal = parseInt(req.query.total);
+        } else if (req.query.totalPositions !== undefined) {
+            ctraderTotal = parseInt(req.query.totalPositions);
+        }
+        
+        if (req.query.buy !== undefined) {
+            ctraderBuy = parseInt(req.query.buy);
+        } else if (req.query.buyPositions !== undefined) {
+            ctraderBuy = parseInt(req.query.buyPositions);
+        }
+        
+        if (req.query.sell !== undefined) {
+            ctraderSell = parseInt(req.query.sell);
+        } else if (req.query.sellPositions !== undefined) {
+            ctraderSell = parseInt(req.query.sellPositions);
+        }
+        // 如果有仓位信息，保存并比较
+        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
+            const ctraderPos = {
+                total: ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : null),
+                buy: ctraderBuy !== null ? ctraderBuy : 0,
+                sell: ctraderSell !== null ? ctraderSell : 0
+            };
+            
+            // 异步比较仓位信息（不阻塞响应）
+            compareAndNotifyPositions(accountIdStr, ctraderPos).catch(err => {
+                console.error('❌ 比较仓位信息异常:', err.message);
             });
         }
         
@@ -691,7 +977,8 @@ app.listen(CONFIG.PORT, () => {
     console.log(`  POST /screenshot    - 接收信号 + 截图 + 发邮件`);
     console.log(`  POST /notify         - 仅发送邮件通知`);
     console.log(`  POST /trade          - 接收EA交易信息（开仓/平仓）[需要 accountId]`);
-    console.log(`  GET  /queue/read     - 读取队列中最早的消息（FIFO，读取后删除）[需要 accountId]`);
+    console.log(`  POST /position/report - 接收EA上报仓位信息（总/多/空）[需要 accountId]`);
+    console.log(`  GET  /queue/read     - 读取队列中最早的消息（FIFO，读取后删除）[需要 accountId，可选仓位参数]`);
     console.log(`  GET  /queue/stats    - 查看队列统计信息`);
     console.log('='.repeat(60));
     console.log('\n⚠️  重要提示:');

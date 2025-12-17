@@ -61,18 +61,32 @@ namespace cAlgo.Robots
             if ((DateTime.Now - _lastRequestTime).TotalSeconds >= RequestInterval)
             {
                 _lastRequestTime = DateTime.Now;
-                // 使用 Task.Run 在后台执行异步操作
-                Task.Run(async () => await RequestQueueMessage());
+                
+                // 在主线程中获取仓位信息（Positions 只能在主线程访问）
+                int totalPositions = Positions.Count;
+                int buyPositions = 0;
+                int sellPositions = 0;
+                
+                foreach (var position in Positions)
+                {
+                    if (position.TradeType == TradeType.Buy)
+                        buyPositions++;
+                    else if (position.TradeType == TradeType.Sell)
+                        sellPositions++;
+                }
+                
+                // 使用 Task.Run 在后台执行异步操作，传递仓位信息
+                Task.Run(async () => await RequestQueueMessage(totalPositions, buyPositions, sellPositions));
             }
         }
 
-        private async Task RequestQueueMessage()
+        private async Task RequestQueueMessage(int totalPositions, int buyPositions, int sellPositions)
         {
             _requestCount++;
 
             try
             {
-                // 构建带账户ID的URL（使用预先获取的账户ID，避免在后台线程访问 Account.Number）
+                // 构建带账户ID和仓位信息的URL（使用预先获取的账户ID，避免在后台线程访问 Account.Number）
                 string urlWithAccountId = ServerURL;
                 if (ServerURL.Contains("?"))
                 {
@@ -82,6 +96,11 @@ namespace cAlgo.Robots
                 {
                     urlWithAccountId += "?accountId=" + _accountId;
                 }
+                
+                // 添加仓位信息到URL查询参数
+                urlWithAccountId += "&total=" + totalPositions;
+                urlWithAccountId += "&buy=" + buyPositions;
+                urlWithAccountId += "&sell=" + sellPositions;
                 
                 // 发送GET请求
                 HttpResponseMessage response = await _httpClient.GetAsync(urlWithAccountId);

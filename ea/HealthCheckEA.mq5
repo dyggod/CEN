@@ -9,13 +9,16 @@
 //--- 输入参数
 input string   ServerURL = "http://127.0.0.1:6699/health";  // 健康检查服务器地址
 input string   TradeServerURL = "http://127.0.0.1:6699/trade";  // 交易信息服务器地址
+input string   PositionReportURL = "http://127.0.0.1:6699/position/report";  // 仓位上报服务器地址
 input int      RequestInterval = 1;                          // 请求间隔（秒）
+input int      PositionReportInterval = 60;                  // 仓位上报间隔（秒，默认60秒=1分钟）
 
 //--- 全局变量
 int requestCount = 0;  // 请求计数
 int successCount = 0;  // 成功计数
 int failCount = 0;     // 失败计数
 ulong processedDeals[];  // 已处理的成交单列表（用于去重）
+datetime lastPositionReportTime = 0;  // 上次仓位上报时间
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -45,6 +48,14 @@ void OnTimer()
 {
     // 发送HTTP请求
     SendHealthCheckRequest();
+    
+    // 检查是否需要上报仓位信息
+    datetime currentTime = TimeCurrent();
+    if(currentTime - lastPositionReportTime >= PositionReportInterval)
+    {
+        SendPositionReport();
+        lastPositionReportTime = currentTime;
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -182,6 +193,10 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     
     // 发送交易信息到服务器
     SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)dealTicket, comment);
+    
+    // 开仓或平仓后立即上报仓位信息（不等待定时器）
+    SendPositionReport();
+    lastPositionReportTime = TimeCurrent();  // 更新上报时间，避免定时器立即再次触发
 }
 
 //+------------------------------------------------------------------+
@@ -236,5 +251,64 @@ void SendTradeInfo(string action, string orderType, string symbol,
     else
     {
         Print("交易信息已发送: ", action, " ", orderType, " ", symbol, " ", volume, "手 @ ", price);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 获取仓位信息并上报                                               |
+//+------------------------------------------------------------------+
+void SendPositionReport()
+{
+    // 获取账户ID
+    long accountId = AccountInfoInteger(ACCOUNT_LOGIN);
+    
+    // 统计仓位信息
+    int totalPositions = PositionsTotal();
+    int buyPositions = 0;
+    int sellPositions = 0;
+    
+    // 遍历所有仓位，统计多单和空单
+    for(int i = 0; i < totalPositions; i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0)
+        {
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            if(posType == POSITION_TYPE_BUY)
+                buyPositions++;
+            else if(posType == POSITION_TYPE_SELL)
+                sellPositions++;
+        }
+    }
+    
+    // 构建JSON数据
+    string json = "{";
+    json += "\"accountId\":" + IntegerToString(accountId) + ",";
+    json += "\"total\":" + IntegerToString(totalPositions) + ",";
+    json += "\"buy\":" + IntegerToString(buyPositions) + ",";
+    json += "\"sell\":" + IntegerToString(sellPositions);
+    json += "}";
+    
+    // 转换为字符数组
+    char data[];
+    char result[];
+    string result_headers;
+    string headers = "Content-Type: application/json\r\n";
+    
+    int jsonLen = StringLen(json);
+    ArrayResize(data, jsonLen);
+    StringToCharArray(json, data, 0, jsonLen);
+    
+    // 发送POST请求
+    int res = WebRequest("POST", PositionReportURL, headers, 5000, data, result, result_headers);
+    
+    if(res == -1)
+    {
+        int error = GetLastError();
+        Print("仓位上报失败 - 错误代码: ", error);
+    }
+    else
+    {
+        Print("仓位信息已上报: 总=", totalPositions, " 多=", buyPositions, " 空=", sellPositions);
     }
 }
