@@ -21,6 +21,9 @@ namespace cAlgo.Robots
         [Parameter("固定手数", DefaultValue = 0, MinValue = 0)]
         public double FixedVolume { get; set; }
 
+        [Parameter("仓位检查标的", DefaultValue = "XAUUSD")]
+        public string CheckSymbols { get; set; }
+
         // 私有变量
         private HttpClient _httpClient;
         private long _accountId = 0;  // 账户ID（在主线程中获取）
@@ -63,16 +66,41 @@ namespace cAlgo.Robots
                 _lastRequestTime = DateTime.Now;
                 
                 // 在主线程中获取仓位信息（Positions 只能在主线程访问）
-                int totalPositions = Positions.Count;
+                // 只统计指定标的的仓位
+                string[] checkSymbolsArray = CheckSymbols.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int totalPositions = 0;
                 int buyPositions = 0;
                 int sellPositions = 0;
                 
                 foreach (var position in Positions)
                 {
-                    if (position.TradeType == TradeType.Buy)
-                        buyPositions++;
-                    else if (position.TradeType == TradeType.Sell)
-                        sellPositions++;
+                    // 检查是否在要检查的标的列表中
+                    bool shouldCheck = false;
+                    if (checkSymbolsArray.Length == 0)
+                    {
+                        // 如果没有配置标的，默认检查所有（兼容旧版本）
+                        shouldCheck = true;
+                    }
+                    else
+                    {
+                        foreach (string symbol in checkSymbolsArray)
+                        {
+                            if (position.SymbolName.Trim() == symbol.Trim())
+                            {
+                                shouldCheck = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (shouldCheck)
+                    {
+                        totalPositions++;
+                        if (position.TradeType == TradeType.Buy)
+                            buyPositions++;
+                        else if (position.TradeType == TradeType.Sell)
+                            sellPositions++;
+                    }
                 }
                 
                 // 使用 Task.Run 在后台执行异步操作，传递仓位信息
@@ -383,8 +411,16 @@ namespace cAlgo.Robots
                 // 计算手数（转换为cTrader的单位，手数转为基础单位）
                 double volumeInUnits = symbol.QuantityToVolumeInUnits(volumeToUse);
 
-                // 先执行开仓（不设置TP/SL，因为可能不准确）
-                var result = ExecuteMarketOrder(tradeType, symbol.Name, volumeInUnits, "QueueBot");
+                // 构建标签：包含 MT5 Position ID，格式为 "QueueBot_MT5PositionId"
+                // 注意：ticket 字段现在使用的是 Position ID（不是 dealTicket），因为开仓和平仓的 dealTicket 不同，但 Position ID 相同
+                string label = "QueueBot";
+                if (message.Ticket.HasValue && message.Ticket.Value > 0)
+                {
+                    label = "QueueBot_" + message.Ticket.Value.ToString();
+                }
+                
+                // 先执行开仓（不设置TP/SL，因为可能不准确），标签中包含 MT5 Position ID
+                var result = ExecuteMarketOrder(tradeType, symbol.Name, volumeInUnits, label);
 
                 if (result.IsSuccessful && result.Position != null)
                 {
@@ -393,7 +429,9 @@ namespace cAlgo.Robots
                         ? volumeToUse + "手（固定手数，消息中为" + message.Volume + "手）" 
                         : volumeToUse + "手";
                     Print("✅ 开仓成功: " + tradeType + " " + message.Symbol + " " + volumeInfo);
-                    Print("   订单号: " + result.Position.Id);
+                    Print("   cTrader订单号: " + result.Position.Id);
+                    if (message.Ticket.HasValue)
+                        Print("   MT5 Position ID: " + message.Ticket.Value + " (已写入标签)");
                     
                     // 开仓成功后，立即修改TP/SL为正确值
                     if (message.TP.HasValue || message.SL.HasValue)
@@ -449,25 +487,47 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                // 根据订单号查找持仓
+                // 根据 MT5 Position ID 查找持仓（通过标签匹配）
+                // 注意：ticket 字段现在使用的是 Position ID（不是 dealTicket），因为开仓和平仓的 dealTicket 不同，但 Position ID 相同
                 Position position = null;
                 
-                // 先尝试通过订单号查找
+                // 构建要查找的标签格式：QueueBot_MT5PositionId
+                string targetLabel = "QueueBot_" + message.Ticket.Value.ToString();
+                
+                // 遍历所有仓位，查找标签匹配的仓位
                 foreach (var pos in Positions)
                 {
-                    if (pos.Id == message.Ticket.Value)
+                    // 检查标签是否匹配（支持完全匹配或包含匹配）
+                    if (pos.Label == targetLabel || pos.Label.Contains("_" + message.Ticket.Value.ToString()))
                     {
                         position = pos;
+                        Print("   找到匹配仓位: cTrader订单号=" + pos.Id + ", 标签=" + pos.Label);
                         break;
                     }
                 }
                 
-                // 如果没找到，尝试通过标签和品种查找
+                // 降级匹配：如果没找到精确匹配，尝试通过标签前缀和品种查找
+                // 这样可以处理以下情况：
+                // 1. EA更新前的老仓位（标签格式不同）
+                // 2. 标签丢失或损坏的情况
+                // 3. 手动创建的仓位（没有MT5 Position ID）
                 if (position == null)
                 {
-                    position = Positions.Find("QueueBot", message.Symbol, TradeType.Buy);
+                    // 先尝试匹配品种和方向
+                    TradeType tradeType = message.OrderType == "buy" ? TradeType.Buy : TradeType.Sell;
+                    position = Positions.Find("QueueBot", message.Symbol, tradeType);
+                    
+                    // 如果还是没找到，尝试另一个方向
                     if (position == null)
-                        position = Positions.Find("QueueBot", message.Symbol, TradeType.Sell);
+                    {
+                        TradeType oppositeType = message.OrderType == "buy" ? TradeType.Sell : TradeType.Buy;
+                        position = Positions.Find("QueueBot", message.Symbol, oppositeType);
+                    }
+                    
+                    if (position != null)
+                    {
+                        Print("   ⚠️  未找到精确匹配（Position ID: " + message.Ticket.Value + "），使用降级匹配: cTrader订单号=" + position.Id + ", 标签=" + position.Label);
+                    }
                 }
 
                 if (position != null)
@@ -529,25 +589,36 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                // 根据订单号查找持仓
+                // 根据 MT5 Position ID 查找持仓（通过标签匹配）
+                // 注意：ticket 字段现在使用的是 Position ID（不是 dealTicket），因为开仓和平仓的 dealTicket 不同，但 Position ID 相同
                 Position position = null;
                 
-                // 先尝试通过订单号查找
+                // 构建要查找的标签格式：QueueBot_MT5PositionId
+                string targetLabel = "QueueBot_" + message.Ticket.Value.ToString();
+                
+                // 遍历所有仓位，查找标签匹配的仓位
                 foreach (var pos in Positions)
                 {
-                    if (pos.Id == message.Ticket.Value)
+                    // 检查标签是否匹配（支持完全匹配或包含匹配）
+                    if (pos.Label == targetLabel || pos.Label.Contains("_" + message.Ticket.Value.ToString()))
                     {
                         position = pos;
+                        Print("   找到匹配仓位: cTrader订单号=" + pos.Id + ", 标签=" + pos.Label);
                         break;
                     }
                 }
                 
-                // 如果没找到，尝试通过标签和品种查找
+                // 如果没找到，尝试通过标签前缀和品种查找（降级匹配）
                 if (position == null)
                 {
                     position = Positions.Find("QueueBot", message.Symbol, TradeType.Buy);
                     if (position == null)
                         position = Positions.Find("QueueBot", message.Symbol, TradeType.Sell);
+                    
+                    if (position != null)
+                    {
+                        Print("   ⚠️  未找到精确匹配，使用降级匹配: cTrader订单号=" + position.Id + ", 标签=" + position.Label);
+                    }
                 }
 
                 if (position != null)

@@ -45,11 +45,13 @@ const CONFIG = {
         // MT5 账户ID列表（用于 trade 接口）
         MT5: [
             '7412666', // 真实
-            '52615313' // 模拟
+            '52615313', // 模拟
+            '52653365', // 模拟
         ],
         // cTrader 账户ID列表（用于 queue/read 接口）
         CTRADER: [
             '6098214', // 真实
+            '6108241', // 真实
             '9694550' // 模拟
         ]
     },
@@ -58,8 +60,14 @@ const CONFIG = {
     ACCOUNT_MAPPING: {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
         '6098214': ['7412666'], // 真实 ctrader > 真实mt5
-        '9694550': ['52615313'] // 模拟 ctrader > 模拟mt5
-    }
+        '9694550': ['52653365'], // 模拟 ctrader > 模拟mt5
+        '6108241': ['52653365'], // 真实 ctrader > 模拟mt5
+    },
+    
+    // 仓位不匹配检查配置：指定要检查的交易标的列表
+    // 只有这些标的的仓位不匹配才会触发告警
+    // 默认只检查 XAUUSD，避免其他标的（如用于保持账号活性的默认仓位）导致误报
+    POSITION_CHECK_SYMBOLS: ['XAUUSD']  // 可以添加多个标的，例如：['XAUUSD', 'EURUSD']
 };
 
 // ==================== 初始化 ====================
@@ -260,12 +268,16 @@ async function compareAndNotifyPositions(ctraderAccountId, ctraderPos) {
             return;
         }
         
-        // 比较汇总后的仓位数量
+        // 比较汇总后的仓位数量（只比较指定标的的仓位）
         const ctraderTotal = ctraderPos.total || 0;
         const ctraderBuy = ctraderPos.buy || 0;
         const ctraderSell = ctraderPos.sell || 0;
         
-        // 检查是否不匹配
+        // 获取要检查的交易标的列表
+        const checkSymbols = CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'];
+        const checkSymbolsText = checkSymbols.join(', ');
+        
+        // 检查是否不匹配（只检查指定标的的仓位）
         if (ctraderTotal !== mt5TotalSum || ctraderBuy !== mt5BuySum || ctraderSell !== mt5SellSum) {
             // 生成账户对的唯一标识（使用所有 MT5 账户ID的组合）
             const mt5AccountsKey = allowedMT5Accounts.join('_');
@@ -292,16 +304,16 @@ MT5 账户: ${detail.accountId}
                 }
                 
                 // 发送邮件通知
-                const emailSubject = `[仓位不匹配警告] cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`;
+                const emailSubject = `[仓位不匹配警告] cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}] - ${checkSymbolsText}`;
                 const emailBody = `
 ⚠️  仓位数量不匹配！
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 仓位对比信息
+📊 仓位对比信息（仅检查标的: ${checkSymbolsText}）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 cTrader 账户: ${ctraderAccountId}
-  - 总仓位: ${ctraderTotal}
+  - 总仓位: ${ctraderTotal}（仅${checkSymbolsText}）
   - 多单: ${ctraderBuy}
   - 空单: ${ctraderSell}
   - 最后更新: ${positionData.ctrader[ctraderAccountId].lastUpdate}
@@ -312,7 +324,7 @@ MT5 账户汇总（${allowedMT5Accounts.length} 个账户）
 ${mt5DetailsText}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 MT5 汇总统计
+📊 MT5 汇总统计（仅${checkSymbolsText}）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   - 总仓位: ${mt5TotalSum}
   - 多单: ${mt5BuySum}

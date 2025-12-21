@@ -12,6 +12,7 @@ input string   TradeServerURL = "http://127.0.0.1:6699/trade";  // 交易信息�
 input string   PositionReportURL = "http://127.0.0.1:6699/position/report";  // 仓位上报服务器地址
 input int      RequestInterval = 1;                          // 请求间隔（秒）
 input int      PositionReportInterval = 60;                  // 仓位上报间隔（秒，默认60秒=1分钟）
+input string   CheckSymbols = "XAUUSD";                     // 仓位检查的交易标的（多个用逗号分隔，如"XAUUSD,EURUSD"）
 
 //--- 全局变量
 int requestCount = 0;  // 请求计数
@@ -109,7 +110,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                 orderType = "sell";
             
             // 发送修改信息到服务器
-            SendTradeInfo("modify", orderType, symbol, 0, 0, sl, tp, ticket, "");
+            // modify 操作使用 positionId 作为 ticket
+            SendTradeInfo("modify", orderType, symbol, 0, 0, sl, tp, ticket, "", 0);
         }
         return;
     }
@@ -192,7 +194,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     }
     
     // 发送交易信息到服务器
-    SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)dealTicket, comment);
+    // 注意：使用 positionId 而不是 dealTicket，因为开仓和平仓的 dealTicket 不同，但 positionId 相同
+    SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)positionId, comment, (long)dealTicket);
     
     // 开仓或平仓后立即上报仓位信息（不等待定时器）
     SendPositionReport();
@@ -204,7 +207,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 //+------------------------------------------------------------------+
 void SendTradeInfo(string action, string orderType, string symbol, 
                    double volume, double price, double sl, double tp, 
-                   long ticket, string comment)
+                   long positionId, string comment, long dealTicket)
 {
     // 获取账户ID
     long accountId = AccountInfoInteger(ACCOUNT_LOGIN);
@@ -222,8 +225,12 @@ void SendTradeInfo(string action, string orderType, string symbol,
         json += ",\"sl\":" + DoubleToString(sl, 5);
     if(tp > 0)
         json += ",\"tp\":" + DoubleToString(tp, 5);
-    if(ticket > 0)
-        json += ",\"ticket\":" + IntegerToString(ticket);
+    // ticket 字段使用 positionId（仓位ID），因为开仓和平仓的 dealTicket 不同，但 positionId 相同
+    if(positionId > 0)
+        json += ",\"ticket\":" + IntegerToString(positionId);
+    // 可选：添加 dealTicket 字段用于记录成交单号（调试用）
+    if(dealTicket > 0)
+        json += ",\"dealTicket\":" + IntegerToString(dealTicket);
     if(comment != "")
         json += ",\"comment\":\"" + comment + "\"";
     
@@ -262,22 +269,56 @@ void SendPositionReport()
     // 获取账户ID
     long accountId = AccountInfoInteger(ACCOUNT_LOGIN);
     
-    // 统计仓位信息
-    int totalPositions = PositionsTotal();
+    // 解析要检查的交易标的列表（用逗号分隔）
+    string symbols[];
+    int symbolCount = StringSplit(CheckSymbols, ',', symbols);
+    
+    // 统计指定标的的仓位信息
+    int totalPositions = 0;
     int buyPositions = 0;
     int sellPositions = 0;
     
-    // 遍历所有仓位，统计多单和空单
-    for(int i = 0; i < totalPositions; i++)
+    // 遍历所有仓位，只统计指定标的的仓位
+    for(int i = 0; i < PositionsTotal(); i++)
     {
         ulong ticket = PositionGetTicket(i);
         if(ticket > 0)
         {
-            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-            if(posType == POSITION_TYPE_BUY)
-                buyPositions++;
-            else if(posType == POSITION_TYPE_SELL)
-                sellPositions++;
+            string posSymbol = PositionGetString(POSITION_SYMBOL);
+            
+            // 检查是否在要检查的标的列表中
+            bool shouldCheck = false;
+            if(symbolCount == 0)
+            {
+                // 如果没有配置标的，默认检查所有（兼容旧版本）
+                shouldCheck = true;
+            }
+            else
+            {
+                for(int j = 0; j < symbolCount; j++)
+                {
+                    // 修剪字符串两端的空格
+                    string trimmedSymbol = symbols[j];
+                    StringTrimRight(trimmedSymbol);
+                    StringTrimLeft(trimmedSymbol);
+                    
+                    if(trimmedSymbol == posSymbol)
+                    {
+                        shouldCheck = true;
+                        break;
+                    }
+                }
+            }
+            
+            if(shouldCheck)
+            {
+                totalPositions++;
+                ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+                if(posType == POSITION_TYPE_BUY)
+                    buyPositions++;
+                else if(posType == POSITION_TYPE_SELL)
+                    sellPositions++;
+            }
         }
     }
     
