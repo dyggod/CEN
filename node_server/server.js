@@ -47,6 +47,7 @@ const CONFIG = {
             '7412666', // 真实
             '52615313', // 模拟
             '52653365', // 模拟
+            '52654434', // 模拟
         ],
         // cTrader 账户ID列表（用于 queue/read 接口）
         CTRADER: [
@@ -60,8 +61,8 @@ const CONFIG = {
     ACCOUNT_MAPPING: {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
         '6098214': ['7412666'], // 真实 ctrader > 真实mt5
-        '9694550': ['52653365'], // 模拟 ctrader > 模拟mt5
-        '6108241': ['52653365'], // 真实 ctrader > 模拟mt5
+        '9694550': ['52654434'], // 模拟 ctrader > 模拟mt5
+        '6108241': ['52653365', '52654434'], // 真实 ctrader > 模拟mt5
     },
     
     // 仓位不匹配检查配置：指定要检查的交易标的列表
@@ -855,6 +856,29 @@ app.get('/queue/read', (req, res) => {
             });
         }
         
+        // 计算「MT5 已空仓但 cTrader 仍有仓位」时需要 cBot 平仓的标的列表
+        let syncCloseSymbols = [];
+        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
+            const ctraderTotalVal = ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : 0);
+            let mt5TotalSum = 0;
+            for (const id of allowedMT5Accounts) {
+                const p = positionData.mt5[id];
+                if (p) mt5TotalSum += (p.total || 0);
+            }
+            if (mt5TotalSum === 0 && ctraderTotalVal > 0) {
+                syncCloseSymbols = [...(CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'])];
+                const symbolsStr = syncCloseSymbols.join(', ');
+                const hl = '\x1b[1;33m'; const red = '\x1b[1;31m'; const reset = '\x1b[0m';
+                console.log('');
+                console.log(hl + '╔' + '═'.repeat(58) + '╗' + reset);
+                console.log(hl + '║' + red + ' 🔄 仓位同步告警 ' + hl + ' '.repeat(42) + '║' + reset);
+                console.log(hl + '║' + reset + ' MT5 对应标的已空仓，cTrader 仍有仓位，通知 cBot 平仓' + hl + ' ║' + reset);
+                console.log(hl + '║ 标的: ' + red + symbolsStr + hl + ' '.repeat(Math.max(0, 50 - symbolsStr.length)) + '║' + reset);
+                console.log(hl + '╚' + '═'.repeat(58) + '╝' + reset);
+                console.log('');
+            }
+        }
+
         // 从允许的 MT5 账户队列中读取消息（按优先级顺序）
         const message = messageQueue.readFromAccounts(allowedMT5Accounts);
         
@@ -866,7 +890,8 @@ app.get('/queue/read', (req, res) => {
                 message: '队列为空',
                 data: null,
                 queueSize: totalQueueSize,
-                allowedMT5Accounts: allowedMT5Accounts
+                allowedMT5Accounts: allowedMT5Accounts,
+                syncCloseSymbols: syncCloseSymbols
             });
         } else {
             // 返回最早的消息
@@ -903,7 +928,8 @@ app.get('/queue/read', (req, res) => {
                 data: message,
                 queueSize: totalQueueSize,
                 mt5AccountId: messageMT5Account,
-                allowedMT5Accounts: allowedMT5Accounts
+                allowedMT5Accounts: allowedMT5Accounts,
+                syncCloseSymbols: syncCloseSymbols
             });
         }
     } catch (error) {

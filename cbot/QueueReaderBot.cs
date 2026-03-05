@@ -163,6 +163,18 @@ namespace cAlgo.Robots
         {
             try
             {
+                // 优先处理仓位同步：MT5 已空仓但 cTrader 仍有仓位时，服务器会返回 syncCloseSymbols，需平掉这些标的的仓位
+                var syncCloseSymbols = ParseSyncCloseSymbols(jsonResponse);
+                if (syncCloseSymbols != null && syncCloseSymbols.Count > 0)
+                {
+                    string symbolsStr = string.Join(", ", syncCloseSymbols);
+                    Print("═══════════════════════════════════════════════════════════");
+                    Print("★★★ 仓位同步告警 ★★★");
+                    Print("MT5 对应标的已空仓，cTrader 仍有仓位，正在平掉以下标的: " + symbolsStr);
+                    Print("═══════════════════════════════════════════════════════════");
+                    CloseAllPositionsForSymbols(syncCloseSymbols);
+                }
+
                 // 检查是否包含"data":null（队列为空）
                 if (jsonResponse.Contains("\"data\":null") || jsonResponse.Contains("\"data\": null"))
                 {
@@ -573,6 +585,82 @@ namespace cAlgo.Robots
                 _tradeSuccessCount++;
                 Print("✅ 已平仓 " + closedCount + " 个持仓");
             }
+        }
+
+        /// <summary>
+        /// 平掉指定标的的所有仓位（仅处理 QueueBot 开的仓，避免误平手动单）
+        /// 当 MT5 对应标的已空仓而 cTrader 仍有仓位时，由服务器下发 syncCloseSymbols，调用此方法同步清空
+        /// </summary>
+        private void CloseAllPositionsForSymbols(System.Collections.Generic.List<string> symbols)
+        {
+            if (symbols == null || symbols.Count == 0) return;
+            int closedCount = 0;
+            foreach (var position in Positions)
+            {
+                if (string.IsNullOrEmpty(position.SymbolName)) continue;
+                if (!position.Label.StartsWith("QueueBot", System.StringComparison.OrdinalIgnoreCase))
+                    continue;
+                string symbolName = position.SymbolName.Trim();
+                bool match = false;
+                foreach (var sym in symbols)
+                {
+                    if (sym != null && sym.Trim().Equals(symbolName, System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = true;
+                        break;
+                    }
+                }
+                if (!match) continue;
+                var result = ClosePosition(position);
+                if (result.IsSuccessful)
+                {
+                    closedCount++;
+                    Print("✅ [仓位同步] 已平仓: " + position.SymbolName + " " + position.TradeType + " 订单号 " + position.Id);
+                }
+                else
+                {
+                    Print("❌ [仓位同步] 平仓失败: " + position.SymbolName + " " + result.Error);
+                }
+            }
+            if (closedCount > 0)
+                _tradeSuccessCount++;
+        }
+
+        /// <summary>
+        /// 从 JSON 响应中解析 syncCloseSymbols 数组，如 "syncCloseSymbols":["XAUUSD"] 或 "syncCloseSymbols":[]
+        /// </summary>
+        private System.Collections.Generic.List<string> ParseSyncCloseSymbols(string json)
+        {
+            var list = new System.Collections.Generic.List<string>();
+            if (string.IsNullOrEmpty(json)) return list;
+            int keyIndex = json.IndexOf("\"syncCloseSymbols\"", System.StringComparison.OrdinalIgnoreCase);
+            if (keyIndex < 0) return list;
+            int bracketStart = json.IndexOf("[", keyIndex);
+            if (bracketStart < 0) return list;
+            int bracketEnd = bracketStart + 1;
+            int depth = 1;
+            while (bracketEnd < json.Length && depth > 0)
+            {
+                char c = json[bracketEnd];
+                if (c == '[') depth++;
+                else if (c == ']') depth--;
+                bracketEnd++;
+            }
+            if (depth != 0) return list;
+            string arrStr = json.Substring(bracketStart, bracketEnd - bracketStart);
+            int i = 1;
+            while (i < arrStr.Length)
+            {
+                int quote = arrStr.IndexOf("\"", i);
+                if (quote < 0) break;
+                int endQuote = arrStr.IndexOf("\"", quote + 1);
+                if (endQuote < 0) break;
+                string symbol = arrStr.Substring(quote + 1, endQuote - quote - 1).Trim();
+                if (!string.IsNullOrEmpty(symbol))
+                    list.Add(symbol);
+                i = endQuote + 1;
+            }
+            return list;
         }
 
         /// <summary>
