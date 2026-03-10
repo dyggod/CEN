@@ -333,15 +333,24 @@ namespace cAlgo.Robots
                     // 获取当前UTC时间
                     DateTime nowUtc = DateTime.UtcNow;
                     
-                    // 计算时间差（秒）
-                    double timeDiff = Math.Abs((nowUtc - messageTimeUtc).TotalSeconds);
+                    // 时间差 = 当前 - 消息时间（正数=消息在过去，负数=消息在“未来”，多为时钟偏差）
+                    double timeDiffSeconds = (nowUtc - messageTimeUtc).TotalSeconds;
                     
-                    if (timeDiff > MessageExpireSeconds)
+                    // 仅当消息时间在过去且距今超过设定秒数时才判为过期；消息在“未来”时不判过期（避免时钟快导致误丢）
+                    if (timeDiffSeconds > MessageExpireSeconds)
                     {
                         Print("消息时间 (UTC+8): " + messageTime.ToString("yyyy-MM-dd HH:mm:ss"));
                         Print("当前时间 (UTC): " + nowUtc.ToString("yyyy-MM-dd HH:mm:ss"));
-                        Print("时间差: " + Math.Round(timeDiff, 2) + " 秒");
+                        Print("时间差: " + Math.Round(timeDiffSeconds, 2) + " 秒（消息已过期）");
                         return true;
+                    }
+                    if (timeDiffSeconds < -60)
+                    { 
+                        Print("消息时间 (UTC+8): " + messageTime.ToString("yyyy-MM-dd HH:mm:ss"));
+                        Print("当前时间 (UTC): " + nowUtc.ToString("yyyy-MM-dd HH:mm:ss"));
+                        Print("时间差: " + Math.Round(timeDiffSeconds, 2) + " 秒（消息已过期）");
+                        // 消息时间晚于当前超过 1 分钟（多为服务器与 cTrader 时钟不一致），按未过期处理
+                        Print("消息时间晚于当前约 " + Math.Round(-timeDiffSeconds / 60, 1) + " 分钟（时钟偏差），按未过期处理");
                     }
                 }
                 else

@@ -3,18 +3,19 @@
  */
 
 /**
- * 将MT5时间（UTC+2）转换为UTC+8（中国时区）
- * @param {string} mt5Timestamp - MT5时间戳，格式: "2025.12.04 18:11:10"
- * @returns {Object} 包含原始时间、UTC时间和UTC+8时间的对象
+ * 将 MT5/EA 服务器时间转换为 UTC+8（北京时间）
+ * @param {string} mt5Timestamp - MT5 时间戳，格式: "2025.12.04 18:11:10" 或 "2025/12/04 18:11:10"
+ * @param {number} mt5UtcOffset - MT5/EA 服务器相对 UTC 的时区偏移（如 3 表示 UTC+3），默认 2
+ * @returns {Object} 包含原始时间、UTC 时间和 UTC+8 时间的对象
  */
-function convertMT5TimeToUTC8(mt5Timestamp) {
+function convertMT5TimeToUTC8(mt5Timestamp, mt5UtcOffset = 2) {
     if (!mt5Timestamp) {
         return null;
     }
 
     try {
-        // 解析MT5时间格式: "2025.12.04 18:11:10"
-        const mt5TimeMatch = mt5Timestamp.match(/(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+        // 解析 MT5 时间格式（支持 . 或 / 分隔）: "2025.12.04 18:11:10"
+        const mt5TimeMatch = mt5Timestamp.match(/(\d{4})[.\/](\d{2})[.\/](\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
         
         if (!mt5TimeMatch) {
             return {
@@ -25,23 +26,27 @@ function convertMT5TimeToUTC8(mt5Timestamp) {
 
         const [, year, month, day, hour, minute, second] = mt5TimeMatch;
 
-        // MT5服务器时区是UTC+2，创建UTC时间对象
-        const mt5Date = new Date(Date.UTC(
+        // 把 EA 发来的时间当作 UTC+mt5UtcOffset 时区的本地时间
+        // 先创建一个 UTC 时间对象（使用输入的年月日时分秒）
+        const utcTime = Date.UTC(
             parseInt(year),
-            parseInt(month) - 1, // 月份从0开始
+            parseInt(month) - 1,
             parseInt(day),
             parseInt(hour),
             parseInt(minute),
             parseInt(second)
-        ));
+        );
+        
+        // 减去 mt5UtcOffset 小时，得到真正的 UTC 时间
+        // （因为输入时间是 UTC+mt5UtcOffset，所以要减去偏移才能得到 UTC）
+        const trueUtcTime = utcTime - mt5UtcOffset * 60 * 60 * 1000;
+        
+        // 加上 8 小时，得到 UTC+8 时间
+        const utc8Time = trueUtcTime + 8 * 60 * 60 * 1000;
+        
+        const utcDate = new Date(trueUtcTime);
+        const utc8Date = new Date(utc8Time);
 
-        // 转换为UTC时间（减去2小时）
-        const utcDate = new Date(mt5Date.getTime() - 2 * 60 * 60 * 1000);
-
-        // 转换为UTC+8时间（加6小时，因为MT5是UTC+2，到UTC+8需要加6小时）
-        const utc8Date = new Date(mt5Date.getTime() + 6 * 60 * 60 * 1000);
-
-        // 格式化UTC+8时间
         const utc8Year = utc8Date.getUTCFullYear();
         const utc8Month = String(utc8Date.getUTCMonth() + 1).padStart(2, '0');
         const utc8Day = String(utc8Date.getUTCDate()).padStart(2, '0');
@@ -52,7 +57,7 @@ function convertMT5TimeToUTC8(mt5Timestamp) {
 
         return {
             original: mt5Timestamp,
-            originalTimezone: 'UTC+2',
+            originalTimezone: 'UTC+' + mt5UtcOffset,
             utc: utcDate.toISOString(),
             utc8: utc8TimeStr,
             utc8Date: utc8Date

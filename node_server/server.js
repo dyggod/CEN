@@ -62,13 +62,16 @@ const CONFIG = {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
         '6098214': ['7412666'], // 真实 ctrader > 真实mt5
         '9694550': ['52654434'], // 模拟 ctrader > 模拟mt5
-        '6108241': ['52653365', '52654434'], // 真实 ctrader > 模拟mt5
+        '6108241': ['52615313', '52654434'], // 真实 ctrader > 模拟mt5
     },
     
     // 仓位不匹配检查配置：指定要检查的交易标的列表
     // 只有这些标的的仓位不匹配才会触发告警
     // 默认只检查 XAUUSD，避免其他标的（如用于保持账号活性的默认仓位）导致误报
-    POSITION_CHECK_SYMBOLS: ['XAUUSD']  // 可以添加多个标的，例如：['XAUUSD', 'EURUSD']
+    POSITION_CHECK_SYMBOLS: ['XAUUSD'],  // 可以添加多个标的，例如：['XAUUSD', 'EURUSD']
+
+    // EA/MT5 服务器时区：相对 UTC 的小时偏移（如 3 表示 UTC+3，北京比 EA 早 5 小时）
+    MT5_UTC_OFFSET: 3
 };
 
 // ==================== 初始化 ====================
@@ -636,10 +639,10 @@ app.post('/trade', async (req, res) => {
             });
         }
         
-        // 处理时间戳转换
+        // 处理时间戳转换（传入 EA 服务器时区偏移，得到正确的 UTC+8）
         let timeResult = null;
         if (timestamp) {
-            timeResult = convertMT5TimeToUTC8(timestamp);
+            timeResult = convertMT5TimeToUTC8(timestamp, CONFIG.MT5_UTC_OFFSET);
         }
 
         // 构建完整的消息对象（包含账户ID）
