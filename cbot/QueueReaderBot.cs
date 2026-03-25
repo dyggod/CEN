@@ -197,6 +197,8 @@ namespace cAlgo.Robots
                         Print("交易品种: " + messageData.Symbol);
                         Print("手数: " + messageData.Volume);
                         Print("价格: " + messageData.Price);
+                        if (!string.IsNullOrEmpty(messageData.MT5Account))
+                            Print("MT5账号: " + messageData.MT5Account);
                         if (messageData.Ticket > 0)
                             Print("订单号: " + messageData.Ticket);
                         if (!string.IsNullOrEmpty(messageData.Utc8Time))
@@ -259,6 +261,7 @@ namespace cAlgo.Robots
             public double? TP { get; set; }
             public long? Ticket { get; set; }
             public string Utc8Time { get; set; }
+            public string MT5Account { get; set; }
         }
 
         /// <summary>
@@ -275,6 +278,7 @@ namespace cAlgo.Robots
                 data.Symbol = ExtractStringValue(json, "symbol");
                 data.Volume = ExtractDoubleValue(json, "volume");
                 data.Price = ExtractDoubleValue(json, "price");
+                data.MT5Account = ExtractStringValue(json, "mt5Account");
                 
                 double? sl = ExtractDoubleValueNullable(json, "sl");
                 if (sl.HasValue && sl.Value > 0) data.SL = sl.Value;
@@ -432,13 +436,8 @@ namespace cAlgo.Robots
                 // 计算手数（转换为cTrader的单位，手数转为基础单位）
                 double volumeInUnits = symbol.QuantityToVolumeInUnits(volumeToUse);
 
-                // 构建标签：包含 MT5 Position ID，格式为 "QueueBot_MT5PositionId"
-                // 注意：ticket 字段现在使用的是 Position ID（不是 dealTicket），因为开仓和平仓的 dealTicket 不同，但 Position ID 相同
-                string label = "QueueBot";
-                if (message.Ticket.HasValue && message.Ticket.Value > 0)
-                {
-                    label = "QueueBot_" + message.Ticket.Value.ToString();
-                }
+                // 构建标签：优先包含 MT5 账号 + Position ID，兼容老格式
+                string label = BuildOrderLabel(message);
                 
                 // 先执行开仓（不设置TP/SL，因为可能不准确），标签中包含 MT5 Position ID
                 var result = ExecuteMarketOrder(tradeType, symbol.Name, volumeInUnits, label);
@@ -451,6 +450,9 @@ namespace cAlgo.Robots
                         : volumeToUse + "手";
                     Print("✅ 开仓成功: " + tradeType + " " + message.Symbol + " " + volumeInfo);
                     Print("   cTrader订单号: " + result.Position.Id);
+                    Print("   标签: " + label);
+                    if (!string.IsNullOrEmpty(message.MT5Account))
+                        Print("   MT5账号: " + message.MT5Account);
                     if (message.Ticket.HasValue)
                         Print("   MT5 Position ID: " + message.Ticket.Value + " (已写入标签)");
                     
@@ -508,48 +510,7 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                // 根据 MT5 Position ID 查找持仓（通过标签匹配）
-                // 注意：ticket 字段现在使用的是 Position ID（不是 dealTicket），因为开仓和平仓的 dealTicket 不同，但 Position ID 相同
-                Position position = null;
-                
-                // 构建要查找的标签格式：QueueBot_MT5PositionId
-                string targetLabel = "QueueBot_" + message.Ticket.Value.ToString();
-                
-                // 遍历所有仓位，查找标签匹配的仓位
-                foreach (var pos in Positions)
-                {
-                    // 检查标签是否匹配（支持完全匹配或包含匹配）
-                    if (pos.Label == targetLabel || pos.Label.Contains("_" + message.Ticket.Value.ToString()))
-                    {
-                        position = pos;
-                        Print("   找到匹配仓位: cTrader订单号=" + pos.Id + ", 标签=" + pos.Label);
-                        break;
-                    }
-                }
-                
-                // 降级匹配：如果没找到精确匹配，尝试通过标签前缀和品种查找
-                // 这样可以处理以下情况：
-                // 1. EA更新前的老仓位（标签格式不同）
-                // 2. 标签丢失或损坏的情况
-                // 3. 手动创建的仓位（没有MT5 Position ID）
-                if (position == null)
-                {
-                    // 先尝试匹配品种和方向
-                    TradeType tradeType = message.OrderType == "buy" ? TradeType.Buy : TradeType.Sell;
-                    position = Positions.Find("QueueBot", message.Symbol, tradeType);
-                    
-                    // 如果还是没找到，尝试另一个方向
-                    if (position == null)
-                    {
-                        TradeType oppositeType = message.OrderType == "buy" ? TradeType.Sell : TradeType.Buy;
-                        position = Positions.Find("QueueBot", message.Symbol, oppositeType);
-                    }
-                    
-                    if (position != null)
-                    {
-                        Print("   ⚠️  未找到精确匹配（Position ID: " + message.Ticket.Value + "），使用降级匹配: cTrader订单号=" + position.Id + ", 标签=" + position.Label);
-                    }
-                }
+                Position position = FindPositionByMessageIdentity(message, "平仓");
 
                 if (position != null)
                 {
@@ -686,37 +647,7 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                // 根据 MT5 Position ID 查找持仓（通过标签匹配）
-                // 注意：ticket 字段现在使用的是 Position ID（不是 dealTicket），因为开仓和平仓的 dealTicket 不同，但 Position ID 相同
-                Position position = null;
-                
-                // 构建要查找的标签格式：QueueBot_MT5PositionId
-                string targetLabel = "QueueBot_" + message.Ticket.Value.ToString();
-                
-                // 遍历所有仓位，查找标签匹配的仓位
-                foreach (var pos in Positions)
-                {
-                    // 检查标签是否匹配（支持完全匹配或包含匹配）
-                    if (pos.Label == targetLabel || pos.Label.Contains("_" + message.Ticket.Value.ToString()))
-                    {
-                        position = pos;
-                        Print("   找到匹配仓位: cTrader订单号=" + pos.Id + ", 标签=" + pos.Label);
-                        break;
-                    }
-                }
-                
-                // 如果没找到，尝试通过标签前缀和品种查找（降级匹配）
-                if (position == null)
-                {
-                    position = Positions.Find("QueueBot", message.Symbol, TradeType.Buy);
-                    if (position == null)
-                        position = Positions.Find("QueueBot", message.Symbol, TradeType.Sell);
-                    
-                    if (position != null)
-                    {
-                        Print("   ⚠️  未找到精确匹配，使用降级匹配: cTrader订单号=" + position.Id + ", 标签=" + position.Label);
-                    }
-                }
+                Position position = FindPositionByMessageIdentity(message, "改仓");
 
                 if (position != null)
                 {
@@ -923,6 +854,106 @@ namespace cAlgo.Robots
             {
                 // 忽略解析错误
             }
+        }
+
+        /// <summary>
+        /// 生成订单标签：
+        /// 1) QueueBot_MT5Account_PositionId
+        /// 2) QueueBot_MT5Account
+        /// 3) QueueBot_PositionId（兼容旧逻辑）
+        /// 4) QueueBot
+        /// </summary>
+        private string BuildOrderLabel(MessageData message)
+        {
+            string account = message != null && !string.IsNullOrEmpty(message.MT5Account)
+                ? message.MT5Account.Trim()
+                : "";
+            string ticket = message != null && message.Ticket.HasValue && message.Ticket.Value > 0
+                ? message.Ticket.Value.ToString()
+                : "";
+
+            if (!string.IsNullOrEmpty(account) && !string.IsNullOrEmpty(ticket))
+                return "QueueBot_" + account + "_" + ticket;
+            if (!string.IsNullOrEmpty(account))
+                return "QueueBot_" + account;
+            if (!string.IsNullOrEmpty(ticket))
+                return "QueueBot_" + ticket;
+            return "QueueBot";
+        }
+
+        /// <summary>
+        /// 按消息身份查找持仓（严格 -> 兼容 -> 降级）
+        /// </summary>
+        private Position FindPositionByMessageIdentity(MessageData message, string purpose)
+        {
+            if (message == null) return null;
+
+            string account = !string.IsNullOrEmpty(message.MT5Account) ? message.MT5Account.Trim() : "";
+            string ticket = message.Ticket.HasValue && message.Ticket.Value > 0 ? message.Ticket.Value.ToString() : "";
+
+            // 1) 精确匹配：QueueBot_account_ticket
+            if (!string.IsNullOrEmpty(account) && !string.IsNullOrEmpty(ticket))
+            {
+                string exactLabel = "QueueBot_" + account + "_" + ticket;
+                foreach (var pos in Positions)
+                {
+                    if (pos.Label == exactLabel)
+                    {
+                        Print("   [" + purpose + "] 精确匹配命中: cTrader订单号=" + pos.Id + ", 标签=" + pos.Label);
+                        return pos;
+                    }
+                }
+            }
+
+            // 2) 账号约束 + ticket 后缀匹配（兼容同账号下标签变体）
+            if (!string.IsNullOrEmpty(account) && !string.IsNullOrEmpty(ticket))
+            {
+                string accountPrefix = "QueueBot_" + account + "_";
+                string ticketSuffix = "_" + ticket;
+                foreach (var pos in Positions)
+                {
+                    if (!string.IsNullOrEmpty(pos.Label)
+                        && pos.Label.StartsWith(accountPrefix, System.StringComparison.Ordinal)
+                        && pos.Label.EndsWith(ticketSuffix, System.StringComparison.Ordinal))
+                    {
+                        Print("   [" + purpose + "] 账号+订单号匹配命中: cTrader订单号=" + pos.Id + ", 标签=" + pos.Label);
+                        return pos;
+                    }
+                }
+            }
+
+            // 3) 旧格式兼容：QueueBot_ticket
+            if (!string.IsNullOrEmpty(ticket))
+            {
+                string legacyLabel = "QueueBot_" + ticket;
+                foreach (var pos in Positions)
+                {
+                    if (pos.Label == legacyLabel)
+                    {
+                        Print("   ⚠️  [" + purpose + "] 兼容匹配（旧标签格式）: cTrader订单号=" + pos.Id + ", 标签=" + pos.Label);
+                        return pos;
+                    }
+                }
+            }
+
+            // 4) 最终降级：旧逻辑（QueueBot + 品种 + 方向）
+            if (!string.IsNullOrEmpty(message.Symbol) && !string.IsNullOrEmpty(message.OrderType))
+            {
+                TradeType tradeType = message.OrderType == "buy" ? TradeType.Buy : TradeType.Sell;
+                Position position = Positions.Find("QueueBot", message.Symbol, tradeType);
+                if (position == null)
+                {
+                    TradeType oppositeType = message.OrderType == "buy" ? TradeType.Sell : TradeType.Buy;
+                    position = Positions.Find("QueueBot", message.Symbol, oppositeType);
+                }
+                if (position != null)
+                {
+                    Print("   ⚠️  [" + purpose + "] 兼容匹配（降级策略）: cTrader订单号=" + position.Id + ", 标签=" + position.Label);
+                    return position;
+                }
+            }
+
+            return null;
         }
 
         protected override void OnStop()

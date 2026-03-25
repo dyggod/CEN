@@ -61,7 +61,7 @@ const CONFIG = {
     ACCOUNT_MAPPING: {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
         '6098214': ['7412666'], // 真实 ctrader > 真实mt5
-        '9694550': ['52654434'], // 模拟 ctrader > 模拟mt5
+        '9694550': ['52654434','52615313'], // 模拟 ctrader > 模拟mt5
         '6108241': ['52615313', '52654434'], // 真实 ctrader > 模拟mt5
     },
     
@@ -648,6 +648,7 @@ app.post('/trade', async (req, res) => {
         // 构建完整的消息对象（包含账户ID）
         const message = {
             accountId: accountIdStr,  // MT5 账户ID
+            mt5Account: accountIdStr, // 给 cBot 的来源账号字段（与 accountId 同值）
             action,
             orderType,
             symbol,
