@@ -71,6 +71,7 @@ namespace cAlgo.Robots
                 int totalPositions = 0;
                 int buyPositions = 0;
                 int sellPositions = 0;
+                var accountPositionCounts = new System.Collections.Generic.Dictionary<string, int>(System.StringComparer.Ordinal);
                 
                 foreach (var position in Positions)
                 {
@@ -100,15 +101,26 @@ namespace cAlgo.Robots
                             buyPositions++;
                         else if (position.TradeType == TradeType.Sell)
                             sellPositions++;
+
+                        // 按标签统计各 MT5 账号在 cTrader 的仓位数量，用于服务端账号级同步判断
+                        string labelAccount;
+                        if (!string.IsNullOrEmpty(position.Label) && TryExtractMt5AccountFromLabel(position.Label, out labelAccount))
+                        {
+                            int oldCount = 0;
+                            accountPositionCounts.TryGetValue(labelAccount, out oldCount);
+                            accountPositionCounts[labelAccount] = oldCount + 1;
+                        }
                     }
                 }
                 
+                string accountPositionsParam = BuildAccountPositionsParam(accountPositionCounts);
+
                 // 使用 Task.Run 在后台执行异步操作，传递仓位信息
-                Task.Run(async () => await RequestQueueMessage(totalPositions, buyPositions, sellPositions));
+                Task.Run(async () => await RequestQueueMessage(totalPositions, buyPositions, sellPositions, accountPositionsParam));
             }
         }
 
-        private async Task RequestQueueMessage(int totalPositions, int buyPositions, int sellPositions)
+        private async Task RequestQueueMessage(int totalPositions, int buyPositions, int sellPositions, string accountPositionsParam)
         {
             _requestCount++;
 
@@ -129,6 +141,8 @@ namespace cAlgo.Robots
                 urlWithAccountId += "&total=" + totalPositions;
                 urlWithAccountId += "&buy=" + buyPositions;
                 urlWithAccountId += "&sell=" + sellPositions;
+                if (!string.IsNullOrEmpty(accountPositionsParam))
+                    urlWithAccountId += "&accountPositions=" + Uri.EscapeDataString(accountPositionsParam);
                 
                 // 发送GET请求
                 HttpResponseMessage response = await _httpClient.GetAsync(urlWithAccountId);
@@ -163,16 +177,36 @@ namespace cAlgo.Robots
         {
             try
             {
-                // 优先处理仓位同步：MT5 已空仓但 cTrader 仍有仓位时，服务器会返回 syncCloseSymbols，需平掉这些标的的仓位
-                var syncCloseSymbols = ParseSyncCloseSymbols(jsonResponse);
-                if (syncCloseSymbols != null && syncCloseSymbols.Count > 0)
+                // 优先处理仓位同步（新协议）：按 MT5 账号 + 标的平仓
+                var syncCloseInstructions = ParseSyncCloseInstructions(jsonResponse);
+                if (syncCloseInstructions != null && syncCloseInstructions.Count > 0)
                 {
-                    string symbolsStr = string.Join(", ", syncCloseSymbols);
                     Print("═══════════════════════════════════════════════════════════");
                     Print("★★★ 仓位同步告警 ★★★");
-                    Print("MT5 对应标的已空仓，cTrader 仍有仓位，正在平掉以下标的: " + symbolsStr);
+                    Print("收到按 MT5 账号维度的仓位同步指令，开始执行定向平仓");
+                    foreach (var ins in syncCloseInstructions)
+                    {
+                        if (ins == null || string.IsNullOrEmpty(ins.MT5Account) || ins.Symbols == null || ins.Symbols.Count == 0)
+                            continue;
+                        string symbolsStr = string.Join(", ", ins.Symbols);
+                        Print("[仓位同步] MT5账号=" + ins.MT5Account + " | 标的=" + symbolsStr);
+                        CloseAllPositionsForAccountSymbols(ins.MT5Account, ins.Symbols);
+                    }
                     Print("═══════════════════════════════════════════════════════════");
-                    CloseAllPositionsForSymbols(syncCloseSymbols);
+                }
+                else
+                {
+                    // 兼容旧协议：仅返回 syncCloseSymbols（无法按账号过滤）
+                    var syncCloseSymbols = ParseSyncCloseSymbols(jsonResponse);
+                    if (syncCloseSymbols != null && syncCloseSymbols.Count > 0)
+                    {
+                        string symbolsStr = string.Join(", ", syncCloseSymbols);
+                        Print("═══════════════════════════════════════════════════════════");
+                        Print("★★★ 仓位同步告警（旧协议兼容） ★★★");
+                        Print("未收到账号维度指令，按旧逻辑平掉以下标的: " + symbolsStr);
+                        Print("═══════════════════════════════════════════════════════════");
+                        CloseAllPositionsForSymbols(syncCloseSymbols);
+                    }
                 }
 
                 // 检查是否包含"data":null（队列为空）
@@ -262,6 +296,15 @@ namespace cAlgo.Robots
             public long? Ticket { get; set; }
             public string Utc8Time { get; set; }
             public string MT5Account { get; set; }
+        }
+
+        /// <summary>
+        /// 仓位同步平仓指令（按 MT5 账号维度）
+        /// </summary>
+        private class SyncCloseInstruction
+        {
+            public string MT5Account { get; set; }
+            public System.Collections.Generic.List<string> Symbols { get; set; }
         }
 
         /// <summary>
@@ -597,6 +640,55 @@ namespace cAlgo.Robots
         }
 
         /// <summary>
+        /// 平掉指定 MT5 账号 + 指定标的的仓位（仅处理 QueueBot 开的仓）
+        /// </summary>
+        private void CloseAllPositionsForAccountSymbols(string mt5Account, System.Collections.Generic.List<string> symbols)
+        {
+            if (string.IsNullOrEmpty(mt5Account) || symbols == null || symbols.Count == 0) return;
+            string account = mt5Account.Trim();
+            int closedCount = 0;
+            foreach (var position in Positions)
+            {
+                if (string.IsNullOrEmpty(position.SymbolName)) continue;
+                if (string.IsNullOrEmpty(position.Label)) continue;
+                if (!position.Label.StartsWith("QueueBot", System.StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string labelAccount;
+                if (!TryExtractMt5AccountFromLabel(position.Label, out labelAccount))
+                    continue; // 无账号标签的旧仓位，不参与账号维度同步平仓
+
+                if (!labelAccount.Equals(account, System.StringComparison.Ordinal))
+                    continue;
+
+                string symbolName = position.SymbolName.Trim();
+                bool match = false;
+                foreach (var sym in symbols)
+                {
+                    if (sym != null && sym.Trim().Equals(symbolName, System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = true;
+                        break;
+                    }
+                }
+                if (!match) continue;
+
+                var result = ClosePosition(position);
+                if (result.IsSuccessful)
+                {
+                    closedCount++;
+                    Print("✅ [仓位同步-按账号] 已平仓: MT5账号=" + account + " " + position.SymbolName + " " + position.TradeType + " 订单号 " + position.Id);
+                }
+                else
+                {
+                    Print("❌ [仓位同步-按账号] 平仓失败: MT5账号=" + account + " " + position.SymbolName + " " + result.Error);
+                }
+            }
+            if (closedCount > 0)
+                _tradeSuccessCount++;
+        }
+
+        /// <summary>
         /// 从 JSON 响应中解析 syncCloseSymbols 数组，如 "syncCloseSymbols":["XAUUSD"] 或 "syncCloseSymbols":[]
         /// </summary>
         private System.Collections.Generic.List<string> ParseSyncCloseSymbols(string json)
@@ -631,6 +723,144 @@ namespace cAlgo.Robots
                 i = endQuote + 1;
             }
             return list;
+        }
+
+        /// <summary>
+        /// 从 JSON 响应中解析 syncCloseInstructions：
+        /// "syncCloseInstructions":[{"mt5Account":"123","symbols":["XAUUSD"]}]
+        /// </summary>
+        private System.Collections.Generic.List<SyncCloseInstruction> ParseSyncCloseInstructions(string json)
+        {
+            var list = new System.Collections.Generic.List<SyncCloseInstruction>();
+            if (string.IsNullOrEmpty(json)) return list;
+
+            int keyIndex = json.IndexOf("\"syncCloseInstructions\"", System.StringComparison.OrdinalIgnoreCase);
+            if (keyIndex < 0) return list;
+            int bracketStart = json.IndexOf("[", keyIndex);
+            if (bracketStart < 0) return list;
+            int bracketEnd = FindMatchingBracketEnd(json, bracketStart, '[', ']');
+            if (bracketEnd < 0) return list;
+
+            string arrStr = json.Substring(bracketStart, bracketEnd - bracketStart + 1);
+            int pos = 0;
+            while (pos < arrStr.Length)
+            {
+                int objStart = arrStr.IndexOf("{", pos);
+                if (objStart < 0) break;
+                int objEnd = FindMatchingBracketEnd(arrStr, objStart, '{', '}');
+                if (objEnd < 0) break;
+
+                string obj = arrStr.Substring(objStart, objEnd - objStart + 1);
+                string account = ExtractStringValue(obj, "mt5Account");
+                var symbols = ParseStringArrayField(obj, "symbols");
+                if (!string.IsNullOrEmpty(account) && symbols.Count > 0)
+                {
+                    list.Add(new SyncCloseInstruction
+                    {
+                        MT5Account = account.Trim(),
+                        Symbols = symbols
+                    });
+                }
+                pos = objEnd + 1;
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 从标签提取 MT5 账号。支持 QueueBot_account_ticket 与 QueueBot_account。
+        /// 不支持旧格式 QueueBot_ticket（返回 false）。
+        /// </summary>
+        private bool TryExtractMt5AccountFromLabel(string label, out string mt5Account)
+        {
+            mt5Account = "";
+            if (string.IsNullOrEmpty(label)) return false;
+            if (!label.StartsWith("QueueBot_", System.StringComparison.Ordinal)) return false;
+
+            string suffix = label.Substring("QueueBot_".Length);
+            if (string.IsNullOrEmpty(suffix)) return false;
+
+            int underscore = suffix.IndexOf("_", System.StringComparison.Ordinal);
+            if (underscore > 0)
+            {
+                mt5Account = suffix.Substring(0, underscore).Trim();
+                return !string.IsNullOrEmpty(mt5Account);
+            }
+
+            bool allDigits = true;
+            foreach (char c in suffix)
+            {
+                if (!char.IsDigit(c))
+                {
+                    allDigits = false;
+                    break;
+                }
+            }
+            if (allDigits) return false; // 视为旧格式 ticket
+
+            mt5Account = suffix.Trim();
+            return !string.IsNullOrEmpty(mt5Account);
+        }
+
+        private int FindMatchingBracketEnd(string text, int startIndex, char openChar, char closeChar)
+        {
+            if (string.IsNullOrEmpty(text) || startIndex < 0 || startIndex >= text.Length) return -1;
+            int depth = 0;
+            for (int i = startIndex; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (c == openChar) depth++;
+                else if (c == closeChar)
+                {
+                    depth--;
+                    if (depth == 0) return i;
+                }
+            }
+            return -1;
+        }
+
+        private System.Collections.Generic.List<string> ParseStringArrayField(string json, string key)
+        {
+            var list = new System.Collections.Generic.List<string>();
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return list;
+            int keyIndex = json.IndexOf("\"" + key + "\"", System.StringComparison.OrdinalIgnoreCase);
+            if (keyIndex < 0) return list;
+            int bracketStart = json.IndexOf("[", keyIndex);
+            if (bracketStart < 0) return list;
+            int bracketEnd = FindMatchingBracketEnd(json, bracketStart, '[', ']');
+            if (bracketEnd < 0) return list;
+
+            string arrStr = json.Substring(bracketStart, bracketEnd - bracketStart + 1);
+            int i = 1;
+            while (i < arrStr.Length)
+            {
+                int quote = arrStr.IndexOf("\"", i, System.StringComparison.Ordinal);
+                if (quote < 0) break;
+                int endQuote = arrStr.IndexOf("\"", quote + 1, System.StringComparison.Ordinal);
+                if (endQuote < 0) break;
+                string value = arrStr.Substring(quote + 1, endQuote - quote - 1).Trim();
+                if (!string.IsNullOrEmpty(value))
+                    list.Add(value);
+                i = endQuote + 1;
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 将账号仓位计数字典序列化为 "account1:count1,account2:count2"
+        /// </summary>
+        private string BuildAccountPositionsParam(System.Collections.Generic.Dictionary<string, int> accountPositionCounts)
+        {
+            if (accountPositionCounts == null || accountPositionCounts.Count == 0)
+                return "";
+
+            var parts = new System.Collections.Generic.List<string>();
+            foreach (var kv in accountPositionCounts)
+            {
+                if (string.IsNullOrEmpty(kv.Key)) continue;
+                if (kv.Value <= 0) continue;
+                parts.Add(kv.Key + ":" + kv.Value);
+            }
+            return string.Join(",", parts);
         }
 
         /// <summary>

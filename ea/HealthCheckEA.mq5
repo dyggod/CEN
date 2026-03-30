@@ -143,9 +143,13 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
     ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
     
-    // 只处理开仓和平仓
-    if(dealEntry != DEAL_ENTRY_IN && dealEntry != DEAL_ENTRY_OUT)
+    // 只处理开仓和平仓：
+    // DEAL_ENTRY_OUT_BY 在批量/对冲平仓场景也会出现，必须按 close 处理
+    if(dealEntry != DEAL_ENTRY_IN && dealEntry != DEAL_ENTRY_OUT && dealEntry != DEAL_ENTRY_OUT_BY)
+    {
+        Print("跳过非开平仓成交事件: deal=", dealTicket, " entry=", (int)dealEntry);
         return;
+    }
     
     // 判断是开仓还是平仓
     string action = (dealEntry == DEAL_ENTRY_IN) ? "open" : "close";

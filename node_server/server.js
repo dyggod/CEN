@@ -45,13 +45,15 @@ const CONFIG = {
         // MT5 账户ID列表（用于 trade 接口）
         MT5: [
             '7412666', // 真实
-            '52615313', // 模拟
-            '52653365', // 模拟
-            '52654434', // 模拟
+            '52615313', // ICMarkets模拟
+            '52653365', // ICMarkets模拟
+            '52654434', // ICMarkets模拟
+            '52815192', // ICMarkets模拟
+            '277561537', // Exness模拟
         ],
         // cTrader 账户ID列表（用于 queue/read 接口）
         CTRADER: [
-            '6098214', // 真实
+            '6098214', // cTrader真实
             '6108241', // 真实
             '9694550' // 模拟
         ]
@@ -61,14 +63,25 @@ const CONFIG = {
     ACCOUNT_MAPPING: {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
         '6098214': ['7412666'], // 真实 ctrader > 真实mt5
-        '9694550': ['52654434','52615313'], // 模拟 ctrader > 模拟mt5
-        '6108241': ['52615313', '52654434'], // 真实 ctrader > 模拟mt5
+        '9694550': ['52654434','52615313', '52815192'], // 模拟 ctrader > 模拟mt5
+        '6108241': [ // 真实 ctrader > 模拟mt5
+            // ============= ICMarkets模拟 =============
+            '52615313', 
+            '52654434', 
+            '52815192',
+            // ============= Exness模拟 =============
+            // '277561537',
+        ], 
     },
     
     // 仓位不匹配检查配置：指定要检查的交易标的列表
     // 只有这些标的的仓位不匹配才会触发告警
     // 默认只检查 XAUUSD，避免其他标的（如用于保持账号活性的默认仓位）导致误报
     POSITION_CHECK_SYMBOLS: ['XAUUSD'],  // 可以添加多个标的，例如：['XAUUSD', 'EURUSD']
+
+    // MT5 仓位数据有效期（毫秒）
+    // 超过此时间未更新则视为“数据过期”，不会用于账号级同步平仓判定，避免误平
+    MT5_POSITION_STALE_MS: 90 * 1000,
 
     // EA/MT5 服务器时区：相对 UTC 的小时偏移（如 3 表示 UTC+3，北京比 EA 早 5 小时）
     MT5_UTC_OFFSET: 3
@@ -128,6 +141,46 @@ const EMAIL_NOTIFY_INTERVAL = 2 * 60 * 1000; // 5分钟
  */
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 判断 MT5 仓位快照是否新鲜
+ */
+function isFreshMt5Position(mt5Pos) {
+    if (!mt5Pos || !mt5Pos.lastUpdate) return false;
+    const ts = Date.parse(mt5Pos.lastUpdate);
+    if (Number.isNaN(ts)) return false;
+    return (Date.now() - ts) <= CONFIG.MT5_POSITION_STALE_MS;
+}
+
+/**
+ * 根据 trade 事件对 MT5 仓位做实时增量更新（分钟上报仍会定期校准）
+ */
+function applyRealtimeMt5PositionDelta(accountIdStr, action, orderType) {
+    if (!accountIdStr || !action) return;
+    const act = String(action).toLowerCase();
+    if (act !== 'open' && act !== 'close') return;
+
+    if (!positionData.mt5[accountIdStr]) {
+        // 尚无基线快照时不盲目创建，等待 EA /position/report 首次上报
+        return;
+    }
+
+    const pos = positionData.mt5[accountIdStr];
+    const isBuy = String(orderType || '').toLowerCase() === 'buy';
+    const isSell = String(orderType || '').toLowerCase() === 'sell';
+
+    if (act === 'open') {
+        pos.total = (pos.total || 0) + 1;
+        if (isBuy) pos.buy = (pos.buy || 0) + 1;
+        if (isSell) pos.sell = (pos.sell || 0) + 1;
+    } else if (act === 'close') {
+        pos.total = Math.max(0, (pos.total || 0) - 1);
+        if (isBuy) pos.buy = Math.max(0, (pos.buy || 0) - 1);
+        if (isSell) pos.sell = Math.max(0, (pos.sell || 0) - 1);
+    }
+
+    pos.lastUpdate = new Date().toISOString();
 }
 
 /**
@@ -669,6 +722,8 @@ app.post('/trade', async (req, res) => {
             const queueSize = messageQueue.size(accountIdStr);
             // 只打印重要信息：操作类型、品种、手数、价格
             console.log(`📊 [MT5:${accountIdStr}] ${action.toUpperCase()} ${orderType} ${symbol} ${volume}手 @ ${price} | 队列:${queueSize}`);
+            // 实时更新仓位快照，减少对分钟级上报的依赖
+            applyRealtimeMt5PositionDelta(accountIdStr, action, orderType);
         } else {
             console.warn('⚠️  消息添加到队列失败');
         }
@@ -833,6 +888,22 @@ app.get('/queue/read', (req, res) => {
         } else if (req.query.sellPositions !== undefined) {
             ctraderSell = parseInt(req.query.sellPositions);
         }
+        // 解析 cBot 上报的账号级仓位统计：accountPositions=acc1:2,acc2:1
+        const ctraderAccountPositions = {};
+        const rawAccountPositions = req.query.accountPositions;
+        if (rawAccountPositions) {
+            const pairs = String(rawAccountPositions).split(',');
+            for (const pair of pairs) {
+                if (!pair) continue;
+                const idx = pair.indexOf(':');
+                if (idx <= 0) continue;
+                const account = pair.substring(0, idx).trim();
+                const count = parseInt(pair.substring(idx + 1).trim(), 10);
+                if (!account || Number.isNaN(count) || count <= 0) continue;
+                ctraderAccountPositions[account] = count;
+            }
+        }
+
         // 如果有仓位信息，保存并比较
         if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
             const ctraderPos = {
@@ -860,24 +931,49 @@ app.get('/queue/read', (req, res) => {
             });
         }
         
-        // 计算「MT5 已空仓但 cTrader 仍有仓位」时需要 cBot 平仓的标的列表
+        // 计算「MT5 已空仓但 cTrader 仍有仓位」时需要 cBot 平仓的指令
+        // 新字段 syncCloseInstructions 按 MT5 账号粒度下发；旧字段 syncCloseSymbols 保留兼容
         let syncCloseSymbols = [];
+        let syncCloseInstructions = [];
         if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
             const ctraderTotalVal = ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : 0);
-            let mt5TotalSum = 0;
-            for (const id of allowedMT5Accounts) {
-                const p = positionData.mt5[id];
-                if (p) mt5TotalSum += (p.total || 0);
+            if (ctraderTotalVal > 0) {
+                const defaultSymbols = [...(CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'])];
+                for (const id of allowedMT5Accounts) {
+                    const p = positionData.mt5[id];
+                    const mt5AccountId = String(id);
+                    const ctraderCountForAccount = ctraderAccountPositions[mt5AccountId] || 0;
+                    const hasFreshMt5Snapshot = isFreshMt5Position(p);
+                    const mt5Total = p ? (p.total || 0) : 0;
+                    // 仅当该 MT5 账号在 cTrader 中确实有对应仓位时，才触发账号级同步平仓告警
+                    // 同时要求该账号有“新鲜”MT5快照，避免把未知/过期数据当成空仓导致误平
+                    if (hasFreshMt5Snapshot && mt5Total === 0 && ctraderCountForAccount > 0) {
+                        syncCloseInstructions.push({
+                            mt5Account: mt5AccountId,
+                            symbols: [...defaultSymbols],
+                            reason: 'mt5_account_flat_but_ctrader_has_positions'
+                        });
+                    }
+                }
             }
-            if (mt5TotalSum === 0 && ctraderTotalVal > 0) {
-                syncCloseSymbols = [...(CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'])];
+            if (syncCloseInstructions.length > 0) {
+                // 兼容旧版 cBot：退化为标的并集（旧版无法按账号过滤）
+                const symbolSet = new Set();
+                for (const ins of syncCloseInstructions) {
+                    for (const sym of (ins.symbols || [])) {
+                        if (sym) symbolSet.add(String(sym));
+                    }
+                }
+                syncCloseSymbols = Array.from(symbolSet);
                 const symbolsStr = syncCloseSymbols.join(', ');
                 const hl = '\x1b[1;33m'; const red = '\x1b[1;31m'; const reset = '\x1b[0m';
                 console.log('');
                 console.log(hl + '╔' + '═'.repeat(58) + '╗' + reset);
                 console.log(hl + '║' + red + ' 🔄 仓位同步告警 ' + hl + ' '.repeat(42) + '║' + reset);
-                console.log(hl + '║' + reset + ' MT5 对应标的已空仓，cTrader 仍有仓位，通知 cBot 平仓' + hl + ' ║' + reset);
+                console.log(hl + '║' + reset + ' MT5 对应账号已空仓，cTrader 仍有仓位，通知 cBot 平仓' + hl + ' ║' + reset);
                 console.log(hl + '║ 标的: ' + red + symbolsStr + hl + ' '.repeat(Math.max(0, 50 - symbolsStr.length)) + '║' + reset);
+                const accountText = syncCloseInstructions.map(item => item.mt5Account).join(', ');
+                console.log(hl + '║ MT5账号: ' + red + accountText + hl + ' '.repeat(Math.max(0, 47 - accountText.length)) + '║' + reset);
                 console.log(hl + '╚' + '═'.repeat(58) + '╝' + reset);
                 console.log('');
             }
@@ -895,7 +991,8 @@ app.get('/queue/read', (req, res) => {
                 data: null,
                 queueSize: totalQueueSize,
                 allowedMT5Accounts: allowedMT5Accounts,
-                syncCloseSymbols: syncCloseSymbols
+                syncCloseSymbols: syncCloseSymbols,
+                syncCloseInstructions: syncCloseInstructions
             });
         } else {
             // 返回最早的消息
@@ -933,7 +1030,8 @@ app.get('/queue/read', (req, res) => {
                 queueSize: totalQueueSize,
                 mt5AccountId: messageMT5Account,
                 allowedMT5Accounts: allowedMT5Accounts,
-                syncCloseSymbols: syncCloseSymbols
+                syncCloseSymbols: syncCloseSymbols,
+                syncCloseInstructions: syncCloseInstructions
             });
         }
     } catch (error) {
