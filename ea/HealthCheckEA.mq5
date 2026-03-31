@@ -111,7 +111,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             
             // 发送修改信息到服务器
             // modify 操作使用 positionId 作为 ticket
-            SendTradeInfo("modify", orderType, symbol, 0, 0, sl, tp, ticket, "", 0);
+            long eventTimeMs = (long)PositionGetInteger(POSITION_TIME_UPDATE_MSC);
+            SendTradeInfo("modify", orderType, symbol, 0, 0, sl, tp, ticket, "", 0, eventTimeMs);
         }
         return;
     }
@@ -199,7 +200,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     
     // 发送交易信息到服务器
     // 注意：使用 positionId 而不是 dealTicket，因为开仓和平仓的 dealTicket 不同，但 positionId 相同
-    SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)positionId, comment, (long)dealTicket);
+    long eventTimeMs = (long)HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
+    SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)positionId, comment, (long)dealTicket, eventTimeMs);
     
     // 开仓或平仓后立即上报仓位信息（不等待定时器）
     SendPositionReport();
@@ -211,17 +213,18 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 //+------------------------------------------------------------------+
 void SendTradeInfo(string action, string orderType, string symbol, 
                    double volume, double price, double sl, double tp, 
-                   long positionId, string comment, long dealTicket)
+                   long positionId, string comment, long dealTicket, long eventTimeMs)
 {
     // 获取账户ID
     long accountId = AccountInfoInteger(ACCOUNT_LOGIN);
+    string sendSymbol = NormalizeSymbolBeforeSend(symbol);
     
     // 构建JSON数据
     string json = "{";
     json += "\"accountId\":" + IntegerToString(accountId) + ",";
     json += "\"action\":\"" + action + "\",";
     json += "\"orderType\":\"" + orderType + "\",";
-    json += "\"symbol\":\"" + symbol + "\",";
+    json += "\"symbol\":\"" + sendSymbol + "\",";
     json += "\"volume\":" + DoubleToString(volume, 2) + ",";
     json += "\"price\":" + DoubleToString(price, 5);
     
@@ -239,6 +242,8 @@ void SendTradeInfo(string action, string orderType, string symbol,
         json += ",\"comment\":\"" + comment + "\"";
     
     json += ",\"timestamp\":\"" + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS) + "\"";
+    if(eventTimeMs > 0)
+        json += ",\"eventTimeMs\":" + IntegerToString(eventTimeMs);
     json += "}";
     
     // 转换为字符数组
@@ -288,7 +293,7 @@ void SendPositionReport()
         ulong ticket = PositionGetTicket(i);
         if(ticket > 0)
         {
-            string posSymbol = PositionGetString(POSITION_SYMBOL);
+            string posSymbol = NormalizeSymbolBeforeSend(PositionGetString(POSITION_SYMBOL));
             
             // 检查是否在要检查的标的列表中
             bool shouldCheck = false;
@@ -305,6 +310,7 @@ void SendPositionReport()
                     string trimmedSymbol = symbols[j];
                     StringTrimRight(trimmedSymbol);
                     StringTrimLeft(trimmedSymbol);
+                    trimmedSymbol = NormalizeSymbolBeforeSend(trimmedSymbol);
                     
                     if(trimmedSymbol == posSymbol)
                     {
@@ -356,4 +362,21 @@ void SendPositionReport()
     {
         Print("仓位信息已上报: 总=", totalPositions, " 多=", buyPositions, " 空=", sellPositions);
     }
+}
+
+//+------------------------------------------------------------------+
+//| 发送前统一品种：仅将 XAUUSDm 归一为 XAUUSD                        |
+//+------------------------------------------------------------------+
+string NormalizeSymbolBeforeSend(string symbol)
+{
+    string s = symbol;
+    StringTrimLeft(s);
+    StringTrimRight(s);
+    string upper = s;
+    StringToUpper(upper);
+
+    if(upper == "XAUUSDM")
+        return "XAUUSD";
+
+    return s;
 }

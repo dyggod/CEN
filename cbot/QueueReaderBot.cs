@@ -237,9 +237,11 @@ namespace cAlgo.Robots
                             Print("订单号: " + messageData.Ticket);
                         if (!string.IsNullOrEmpty(messageData.Utc8Time))
                             Print("时间 (UTC+8): " + messageData.Utc8Time);
+                        if (messageData.EventTimeMs.HasValue)
+                            Print("消息时间戳(ms): " + messageData.EventTimeMs.Value);
                         
                         // 检查消息是否过期
-                        if (IsMessageExpired(messageData.Utc8Time))
+                        if (IsMessageExpired(messageData.EventTimeMs, messageData.Utc8Time))
                         {
                             _expiredCount++;
                             Print("⚠️  消息已过期，丢弃（超过 " + MessageExpireSeconds + " 秒）");
@@ -295,6 +297,7 @@ namespace cAlgo.Robots
             public double? TP { get; set; }
             public long? Ticket { get; set; }
             public string Utc8Time { get; set; }
+            public long? EventTimeMs { get; set; }
             public string MT5Account { get; set; }
         }
 
@@ -331,6 +334,9 @@ namespace cAlgo.Robots
                 
                 long? ticket = ExtractLongValueNullable(json, "ticket");
                 if (ticket.HasValue && ticket.Value > 0) data.Ticket = ticket.Value;
+
+                long? eventTimeMs = ExtractLongValueNullable(json, "eventTimeMs");
+                if (eventTimeMs.HasValue && eventTimeMs.Value > 0) data.EventTimeMs = eventTimeMs.Value;
                 
                 // 提取时间信息
                 if (json.Contains("\"timeConverted\""))
@@ -359,8 +365,42 @@ namespace cAlgo.Robots
         /// <summary>
         /// 检查消息是否过期
         /// </summary>
-        private bool IsMessageExpired(string utc8Time)
+        private bool IsMessageExpired(long? eventTimeMs, string utc8Time)
         {
+            // 统一判定优先使用 UTC 毫秒时间戳，彻底规避经纪商时区差异
+            if (eventTimeMs.HasValue && eventTimeMs.Value > 0)
+            {
+                try
+                {
+                    long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    double timeDiffSeconds = (nowMs - eventTimeMs.Value) / 1000.0;
+
+                    if (timeDiffSeconds > MessageExpireSeconds)
+                    {
+                        DateTimeOffset eventUtc = DateTimeOffset.FromUnixTimeMilliseconds(eventTimeMs.Value);
+                        Print("消息时间戳(ms): " + eventTimeMs.Value);
+                        Print("消息时间 (UTC): " + eventUtc.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
+                        Print("当前时间 (UTC): " + DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"));
+                        Print("时间差: " + Math.Round(timeDiffSeconds, 2) + " 秒（消息已过期）");
+                        return true;
+                    }
+                    if (timeDiffSeconds < -60)
+                    {
+                        Print("消息时间戳(ms): " + eventTimeMs.Value);
+                        Print("当前时间 (UTC): " + DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"));
+                        Print("时间差: " + Math.Round(timeDiffSeconds, 2) + " 秒");
+                        Print("消息时间晚于当前约 " + Math.Round(-timeDiffSeconds / 60, 1) + " 分钟（时钟偏差），按未过期处理");
+                    }
+
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    Print("时间戳解析异常: " + ex.Message);
+                }
+            }
+
+            // 兼容旧消息：没有 eventTimeMs 时退回到 UTC+8 字符串判断
             if (string.IsNullOrEmpty(utc8Time))
                 return false; // 如果没有时间信息，不判断过期
             
@@ -395,7 +435,7 @@ namespace cAlgo.Robots
                     { 
                         Print("消息时间 (UTC+8): " + messageTime.ToString("yyyy-MM-dd HH:mm:ss"));
                         Print("当前时间 (UTC): " + nowUtc.ToString("yyyy-MM-dd HH:mm:ss"));
-                        Print("时间差: " + Math.Round(timeDiffSeconds, 2) + " 秒（消息已过期）");
+                        Print("时间差: " + Math.Round(timeDiffSeconds, 2) + " 秒");
                         // 消息时间晚于当前超过 1 分钟（多为服务器与 cTrader 时钟不一致），按未过期处理
                         Print("消息时间晚于当前约 " + Math.Round(-timeDiffSeconds / 60, 1) + " 分钟（时钟偏差），按未过期处理");
                     }

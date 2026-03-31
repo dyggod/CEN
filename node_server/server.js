@@ -63,7 +63,7 @@ const CONFIG = {
     ACCOUNT_MAPPING: {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
         '6098214': ['7412666'], // 真实 ctrader > 真实mt5
-        '9694550': ['52654434','52615313', '52815192'], // 模拟 ctrader > 模拟mt5
+        '9694550': ['52654434','52615313', '52815192', '277561537'], // 模拟 ctrader > 模拟mt5
         '6108241': [ // 真实 ctrader > 模拟mt5
             // ============= ICMarkets模拟 =============
             '52615313', 
@@ -666,7 +666,8 @@ app.post('/trade', async (req, res) => {
             tp,               // 止盈价
             ticket,           // 订单号
             comment,           // 备注
-            timestamp          // 时间戳
+            timestamp,         // 旧版字符串时间（兼容）
+            eventTimeMs        // 统一UTC毫秒时间戳（推荐）
         } = req.body;
         
         // 验证账户ID
@@ -692,10 +693,45 @@ app.post('/trade', async (req, res) => {
             });
         }
         
-        // 处理时间戳转换（传入 EA 服务器时区偏移，得到正确的 UTC+8）
+        // 统一消息时间：优先使用 UTC 毫秒时间戳，避免经纪商时区差异导致误判
+        let normalizedEventTimeMs = null;
+        if (eventTimeMs !== undefined && eventTimeMs !== null && eventTimeMs !== '') {
+            const parsedEventTimeMs = Number(eventTimeMs);
+            if (Number.isFinite(parsedEventTimeMs) && parsedEventTimeMs > 0) {
+                normalizedEventTimeMs = Math.floor(parsedEventTimeMs);
+            }
+        }
+
+        // 兼容旧客户端：若未提供 eventTimeMs，退回使用字符串时间（仅用于过渡）
+        if (!normalizedEventTimeMs && timestamp) {
+            const parsedLegacyTime = Date.parse(String(timestamp).replace(/\./g, '-'));
+            if (!Number.isNaN(parsedLegacyTime)) {
+                normalizedEventTimeMs = parsedLegacyTime;
+            }
+        }
+
+        // 处理时间戳转换（传入 EA 服务器时区偏移，得到日志展示用 UTC+8）
         let timeResult = null;
         if (timestamp) {
             timeResult = convertMT5TimeToUTC8(timestamp, CONFIG.MT5_UTC_OFFSET);
+        }
+
+        // 若仅有 eventTimeMs，仍生成 UTC+8 展示时间，便于日志排查
+        if (!timeResult && normalizedEventTimeMs) {
+            const utc8Date = new Date(normalizedEventTimeMs + 8 * 60 * 60 * 1000);
+            const utc8Year = utc8Date.getUTCFullYear();
+            const utc8Month = String(utc8Date.getUTCMonth() + 1).padStart(2, '0');
+            const utc8Day = String(utc8Date.getUTCDate()).padStart(2, '0');
+            const utc8Hour = String(utc8Date.getUTCHours()).padStart(2, '0');
+            const utc8Min = String(utc8Date.getUTCMinutes()).padStart(2, '0');
+            const utc8Sec = String(utc8Date.getUTCSeconds()).padStart(2, '0');
+            timeResult = {
+                original: null,
+                originalTimezone: 'UTC',
+                utc: new Date(normalizedEventTimeMs).toISOString(),
+                utc8: `${utc8Year}/${utc8Month}/${utc8Day} ${utc8Hour}:${utc8Min}:${utc8Sec}`,
+                utc8Date: utc8Date
+            };
         }
 
         // 构建完整的消息对象（包含账户ID）
@@ -712,6 +748,7 @@ app.post('/trade', async (req, res) => {
             ticket: ticket || null,
             comment: comment || null,
             timestamp: timestamp || null,
+            eventTimeMs: normalizedEventTimeMs,
             timeConverted: timeResult || null,
             receivedAt: new Date().toISOString()
         };
@@ -1015,6 +1052,9 @@ app.get('/queue/read', (req, res) => {
             }
             if (message.timeConverted && message.timeConverted.utc8) {
                 console.log('║ 时间 (UTC+8): ' + message.timeConverted.utc8.padEnd(43) + '║');
+            }
+            if (message.eventTimeMs) {
+                console.log('║ 消息时间戳(ms): ' + String(message.eventTimeMs).padEnd(39) + '║');
             }
             console.log('╠' + '═'.repeat(58) + '╣');
             
