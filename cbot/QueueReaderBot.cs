@@ -15,7 +15,7 @@ namespace cAlgo.Robots
         [Parameter("请求间隔（秒）", DefaultValue = 1, MinValue = 1)]
         public int RequestInterval { get; set; }
 
-        [Parameter("消息过期时间（秒）", DefaultValue = 5, MinValue = 1)]
+        [Parameter("消息过期时间（秒）", DefaultValue = 10, MinValue = 1)]
         public int MessageExpireSeconds { get; set; }
 
         [Parameter("固定手数", DefaultValue = 0, MinValue = 0)]
@@ -34,6 +34,9 @@ namespace cAlgo.Robots
         private int _tradeSuccessCount = 0;  // 交易成功计数
         private int _tradeFailCount = 0;  // 交易失败计数
         private DateTime _lastRequestTime = DateTime.MinValue;
+        /// <summary>各 MT5 账号最近一次仓位同步成功平掉至少一单的时间（UTC），用于解释紧随其后的队列 close/modify 找不到持仓</summary>
+        private readonly System.Collections.Generic.Dictionary<string, DateTime> _lastAccountSyncCloseUtc =
+            new System.Collections.Generic.Dictionary<string, DateTime>(System.StringComparer.Ordinal);
 
         protected override void OnStart()
         {
@@ -611,7 +614,7 @@ namespace cAlgo.Robots
                 }
                 else
                 {
-                    Print("⚠️  未找到订单号 " + message.Ticket.Value + " 的持仓");
+                    PrintPositionNotFoundHint(message, "平仓");
                 }
             }
             catch (Exception ex)
@@ -619,6 +622,30 @@ namespace cAlgo.Robots
                 _tradeFailCount++;
                 Print("❌ 平仓异常: " + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// 队列 close/modify 找不到持仓：若该 MT5 账号刚被仓位同步平过，提示可能为重复消息。
+        /// </summary>
+        private void PrintPositionNotFoundHint(MessageData message, string actionLabel)
+        {
+            long ticket = message.Ticket.HasValue ? message.Ticket.Value : 0;
+            string acc = message.MT5Account != null ? message.MT5Account.Trim() : "";
+            if (!string.IsNullOrEmpty(acc))
+            {
+                DateTime t;
+                if (_lastAccountSyncCloseUtc.TryGetValue(acc, out t))
+                {
+                    double sec = (DateTime.UtcNow - t).TotalSeconds;
+                    if (sec >= 0 && sec <= 30)
+                    {
+                        Print("ℹ️  " + actionLabel + "：未找到订单号 " + ticket + " 的持仓（该 MT5 账号约 " + Math.Round(sec, 1) +
+                              " 秒前已由仓位同步平仓；队列中重复到达时可忽略）");
+                        return;
+                    }
+                }
+            }
+            Print("⚠️  " + actionLabel + "：未找到订单号 " + ticket + " 的持仓");
         }
 
         /// <summary>
@@ -725,7 +752,10 @@ namespace cAlgo.Robots
                 }
             }
             if (closedCount > 0)
+            {
                 _tradeSuccessCount++;
+                _lastAccountSyncCloseUtc[account] = DateTime.UtcNow;
+            }
         }
 
         /// <summary>
@@ -959,7 +989,7 @@ namespace cAlgo.Robots
                 }
                 else
                 {
-                    Print("⚠️  未找到订单号 " + message.Ticket.Value + " 的持仓");
+                    PrintPositionNotFoundHint(message, "改仓");
                 }
             }
             catch (Exception ex)

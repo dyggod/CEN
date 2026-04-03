@@ -70,7 +70,7 @@ const CONFIG = {
             '52654434', 
             '52815192',
             // ============= Exness模拟 =============
-            // '277561537',
+            '277561537',
         ], 
     },
     
@@ -79,9 +79,8 @@ const CONFIG = {
     // 默认只检查 XAUUSD，避免其他标的（如用于保持账号活性的默认仓位）导致误报
     POSITION_CHECK_SYMBOLS: ['XAUUSD'],  // 可以添加多个标的，例如：['XAUUSD', 'EURUSD']
 
-    // MT5 仓位数据有效期（毫秒）
-    // 超过此时间未更新则视为“数据过期”，不会用于账号级同步平仓判定，避免误平
-    MT5_POSITION_STALE_MS: 90 * 1000,
+    // MT5 仓位快照有效期（毫秒）：用于同步强平——以 EA /position/report 为准，需覆盖最慢上报间隔（如 30s）并留余量
+    MT5_POSITION_STALE_MS: 45 * 1000,
 
     // EA/MT5 服务器时区：相对 UTC 的小时偏移（如 3 表示 UTC+3，北京比 EA 早 5 小时）
     MT5_UTC_OFFSET: 3
@@ -131,8 +130,8 @@ const positionData = {
 // 记录每个账户对的上次发送邮件时间
 // 格式: { "ctraderAccountId_mt5AccountId": timestamp }
 const lastEmailSentTime = {};
-// 最小发送间隔（毫秒），默认2分钟
-const EMAIL_NOTIFY_INTERVAL = 2 * 60 * 1000; // 5分钟
+// 最小发送间隔（毫秒）：仓位不匹配邮件节流
+const EMAIL_NOTIFY_INTERVAL = 30 * 1000;
 
 // ==================== 工具函数 ====================
 
@@ -144,13 +143,25 @@ function sleep(ms) {
 }
 
 /**
- * 判断 MT5 仓位快照是否新鲜
+ * 判断 MT5 仓位快照是否新鲜（基于 lastUpdate，兼容旧数据）
  */
 function isFreshMt5Position(mt5Pos) {
     if (!mt5Pos || !mt5Pos.lastUpdate) return false;
     const ts = Date.parse(mt5Pos.lastUpdate);
     if (Number.isNaN(ts)) return false;
     return (Date.now() - ts) <= CONFIG.MT5_POSITION_STALE_MS;
+}
+
+/**
+ * 同步强平：以 EA 主动上报为准——有 lastReportAt 时只看它是否在有效期内；无该字段（旧数据）才用 lastUpdate
+ */
+function isEaReportFreshForSyncClose(mt5Pos) {
+    if (!mt5Pos) return false;
+    if (mt5Pos.lastReportAt) {
+        const t = Date.parse(mt5Pos.lastReportAt);
+        return !Number.isNaN(t) && (Date.now() - t) <= CONFIG.MT5_POSITION_STALE_MS;
+    }
+    return isFreshMt5Position(mt5Pos);
 }
 
 /**
@@ -834,12 +845,14 @@ app.post('/position/report', async (req, res) => {
         const buyPos = parseInt(buy) || 0;
         const sellPos = parseInt(sell) || 0;
         
-        // 保存仓位信息
+        const nowIso = new Date().toISOString();
+        // EA 主动上报为权威：记录 lastReportAt，供同步强平只信任「近期上报过的空仓」
         positionData.mt5[accountIdStr] = {
             total: totalPos,
             buy: buyPos,
             sell: sellPos,
-            lastUpdate: new Date().toISOString()
+            lastUpdate: nowIso,
+            lastReportAt: nowIso
         };
         
         console.log(`📊 [MT5:${accountIdStr}] 仓位上报 - 总:${totalPos} 多:${buyPos} 空:${sellPos}`);
@@ -980,10 +993,9 @@ app.get('/queue/read', (req, res) => {
                     const p = positionData.mt5[id];
                     const mt5AccountId = String(id);
                     const ctraderCountForAccount = ctraderAccountPositions[mt5AccountId] || 0;
-                    const hasFreshMt5Snapshot = isFreshMt5Position(p);
+                    const hasFreshMt5Snapshot = isEaReportFreshForSyncClose(p);
                     const mt5Total = p ? (p.total || 0) : 0;
-                    // 仅当该 MT5 账号在 cTrader 中确实有对应仓位时，才触发账号级同步平仓告警
-                    // 同时要求该账号有“新鲜”MT5快照，避免把未知/过期数据当成空仓导致误平
+                    // EA 上报该账号 total=0（且在快照有效期内），且 cBot 按标签统计该 MT5 账号仍有仓 → 按账号强平（账号间互不影响）
                     if (hasFreshMt5Snapshot && mt5Total === 0 && ctraderCountForAccount > 0) {
                         syncCloseInstructions.push({
                             mt5Account: mt5AccountId,
