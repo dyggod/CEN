@@ -9,6 +9,7 @@ const util = require('util');
 const execPromise = util.promisify(exec);
 const { convertMT5TimeToUTC8 } = require('./tools/utils');
 const messageQueue = require('./tools/messageQueue');
+const { startAutoLogRotation } = require('./scripts/rotate-logs');
 
 // ==================== 配置区域 ====================
 const CONFIG = {
@@ -50,6 +51,9 @@ const CONFIG = {
             '52654434', // ICMarkets模拟
             '52815192', // ICMarkets模拟
             '277561537', // Exness模拟
+            '1078529', // VTMarkets模拟
+            '1085394', // VTMarkets模拟
+            '27013222', // VTMarkets真实
         ],
         // cTrader 账户ID列表（用于 queue/read 接口）
         CTRADER: [
@@ -63,14 +67,19 @@ const CONFIG = {
     ACCOUNT_MAPPING: {
         // 默认配置：cTrader账户 6098214 可以读取 MT5账户 7412666 的消息
         '6098214': ['7412666'], // 真实 ctrader > 真实mt5
-        '9694550': ['52654434','52615313', '52815192', '277561537'], // 模拟 ctrader > 模拟mt5
+        '9694550': ['52654434','52615313', '52815192', '277561537', '1078529'], // 模拟 ctrader > 模拟mt5
         '6108241': [ // 真实 ctrader > 模拟mt5
             // ============= ICMarkets模拟 =============
             '52615313', 
             '52654434', 
             '52815192',
             // ============= Exness模拟 =============
-            '277561537',
+            // '277561537',
+            // ============= VTMarkets模拟 =============
+            '1078529',
+            '1085394',
+            // ============= VTMarkets真实 =============
+            '27013222',
         ], 
     },
     
@@ -1180,6 +1189,8 @@ app.listen(CONFIG.PORT, () => {
     console.log('4. 按 Ctrl+C 停止服务器');
     console.log('='.repeat(60) + '\n');
     console.log('等待信号中...\n');
+    console.log('📜 日志: npm run logs:rotate 手动归档至 logs/history；已启用跨自然日自动滚动（每 10 分钟检查）\n');
+    startAutoLogRotation(10 * 60 * 1000);
 });
 
 // 优雅关闭

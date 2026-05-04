@@ -375,7 +375,7 @@ string NormalizeSymbolBeforeSend(string symbol)
     string upper = s;
     StringToUpper(upper);
 
-    if(upper == "XAUUSDM")
+    if(upper == "XAUUSDM" || upper == "XAUUSD-ECN")
         return "XAUUSD";
 
     return s;
