@@ -70,9 +70,9 @@ const CONFIG = {
         '9694550': ['52654434','52615313', '52815192', '277561537', '1078529'], // 模拟 ctrader > 模拟mt5
         '6108241': [ // 真实 ctrader > 模拟mt5
             // ============= ICMarkets模拟 =============
-            '52615313', 
-            '52654434', 
-            '52815192',
+            // '52615313', 
+            // '52654434', 
+            // '52815192',
             // ============= Exness模拟 =============
             // '277561537',
             // ============= VTMarkets模拟 =============
@@ -686,6 +686,7 @@ app.post('/trade', async (req, res) => {
             tp,               // 止盈价
             ticket,           // 订单号
             comment,           // 备注
+            pendingType,       // 挂单类型：'limit' / 'stop'
             timestamp,         // 旧版字符串时间（兼容）
             eventTimeMs        // 统一UTC毫秒时间戳（推荐）
         } = req.body;
@@ -719,6 +720,21 @@ app.post('/trade', async (req, res) => {
             const parsedEventTimeMs = Number(eventTimeMs);
             if (Number.isFinite(parsedEventTimeMs) && parsedEventTimeMs > 0) {
                 normalizedEventTimeMs = Math.floor(parsedEventTimeMs);
+            }
+        }
+
+        // 某些经纪商环境下，eventTimeMs 可能按“服务器本地时间”编码为毫秒值（非UTC epoch）
+        // 现象：消息时间整体领先当前UTC约 MT5_UTC_OFFSET 小时（如 +3h/+5h）
+        // 这里做受控校正：仅当偏移接近配置值且明显领先时，按配置回拨到 UTC。
+        if (normalizedEventTimeMs) {
+            const nowMs = Date.now();
+            const driftMs = normalizedEventTimeMs - nowMs;
+            const offsetMs = Number(CONFIG.MT5_UTC_OFFSET || 0) * 60 * 60 * 1000;
+            const driftAbs = Math.abs(driftMs);
+            const driftVsOffsetAbs = Math.abs(driftAbs - Math.abs(offsetMs));
+            const appearsServerLocalEpoch = driftMs > 2 * 60 * 1000 && Math.abs(offsetMs) > 0 && driftVsOffsetAbs <= 20 * 60 * 1000;
+            if (appearsServerLocalEpoch) {
+                normalizedEventTimeMs -= offsetMs;
             }
         }
 
@@ -767,6 +783,7 @@ app.post('/trade', async (req, res) => {
             tp: tp || null,
             ticket: ticket || null,
             comment: comment || null,
+            pendingType: pendingType || null,
             timestamp: timestamp || null,
             eventTimeMs: normalizedEventTimeMs,
             timeConverted: timeResult || null,
@@ -774,15 +791,21 @@ app.post('/trade', async (req, res) => {
         };
 
         // 将消息添加到队列（按 MT5 账户ID 分组）
-        const added = messageQueue.add(message);
-        if (added) {
+        const addResult = messageQueue.addWithResult(message);
+        if (addResult.accepted) {
             const queueSize = messageQueue.size(accountIdStr);
             // 只打印重要信息：操作类型、品种、手数、价格
             console.log(`📊 [MT5:${accountIdStr}] ${action.toUpperCase()} ${orderType} ${symbol} ${volume}手 @ ${price} | 队列:${queueSize}`);
             // 实时更新仓位快照，减少对分钟级上报的依赖
             applyRealtimeMt5PositionDelta(accountIdStr, action, orderType);
         } else {
-            console.warn('⚠️  消息添加到队列失败');
+            if (addResult.reason === 'duplicate_event') {
+                console.warn(`⚠️  重复事件已忽略: [MT5:${accountIdStr}] ${action} ticket:${ticket || 0}`);
+            } else if (addResult.reason === 'out_of_order_event') {
+                console.warn(`⚠️  乱序旧事件已忽略: [MT5:${accountIdStr}] ${action} ticket:${ticket || 0} detail:${addResult.detail || ''}`);
+            } else {
+                console.warn(`⚠️  消息添加到队列失败: reason=${addResult.reason || 'unknown'}`);
+            }
         }
         
         res.json({

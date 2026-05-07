@@ -7,22 +7,84 @@ class MessageQueue {
     constructor() {
         this.queues = {}; // 按 MT5 账户ID 分组的队列对象 { mt5AccountId: [messages] }
         this.maxSize = 1000; // 每个队列的最大容量，防止内存溢出
-        this.processedMessages = {}; // 已处理的消息记录，用于去重 { mt5AccountId: Set<messageKey> }
-        this.maxProcessedSize = 10000; // 每个账户最多保留的已处理记录数
+        // 最近已接收事件（带时间戳），用于短窗口去重：{ mt5AccountId: Map<fingerprint, ts> }
+        this.recentFingerprints = {};
+        // 每个逻辑键最近一次事件时间，用于乱序保护：{ mt5AccountId: Map<orderKey, eventTimeMs> }
+        this.latestEventTimeByOrderKey = {};
+        this.dedupeWindowMs = 5 * 60 * 1000; // 指纹去重窗口（5分钟）
+        this.maxFingerprintSize = 10000; // 每账户最多保留的指纹数量
+        this.maxOrderKeySize = 5000; // 每账户最多保留的 orderKey 数量
     }
     
     /**
-     * 生成消息的唯一键（用于去重）
+     * 生成消息事件指纹（用于短窗口去重）
      * @param {Object} message - 消息对象
      * @returns {string} 唯一键
      */
-    _getMessageKey(message) {
-        // 使用 accountId + ticket + action 作为唯一键
-        // 对于 modify 操作，使用 accountId + ticket + action + sl + tp
-        if (message.action === 'modify') {
-            return `${message.accountId}_${message.ticket}_${message.action}_${message.sl || 0}_${message.tp || 0}`;
+    _getFingerprint(message) {
+        const action = String(message.action || '');
+        const accountId = String(message.accountId || '');
+        const ticket = message.ticket || 0;
+        const eventTimeMs = Number.isFinite(Number(message.eventTimeMs)) ? Math.floor(Number(message.eventTimeMs)) : 0;
+        const symbol = String(message.symbol || '');
+        const orderType = String(message.orderType || '');
+        const pendingType = String(message.pendingType || '');
+        const volume = Number(message.volume || 0);
+        const price = Number(message.price || 0);
+        const sl = Number(message.sl || 0);
+        const tp = Number(message.tp || 0);
+        return [
+            accountId, action, ticket, eventTimeMs,
+            symbol, orderType, pendingType,
+            volume, price, sl, tp
+        ].join('|');
+    }
+
+    /**
+     * 生成乱序保护键（同一实体+动作链路）
+     * @param {Object} message
+     * @returns {string}
+     */
+    _getOrderKey(message) {
+        const accountId = String(message.accountId || '');
+        const action = String(message.action || '');
+        const symbol = String(message.symbol || '');
+        const orderType = String(message.orderType || '');
+        const pendingType = String(message.pendingType || '');
+        const ticket = message.ticket || 0;
+        return `${accountId}|${action}|${ticket}|${symbol}|${orderType}|${pendingType}`;
+    }
+
+    _cleanupMaps(mt5AccountId) {
+        const now = Date.now();
+        const fpMap = this.recentFingerprints[mt5AccountId];
+        if (fpMap) {
+            for (const [key, ts] of fpMap.entries()) {
+                if (!Number.isFinite(ts) || (now - ts) > this.dedupeWindowMs) {
+                    fpMap.delete(key);
+                }
+            }
+            if (fpMap.size > this.maxFingerprintSize) {
+                const excess = fpMap.size - this.maxFingerprintSize;
+                let i = 0;
+                for (const key of fpMap.keys()) {
+                    fpMap.delete(key);
+                    i++;
+                    if (i >= excess) break;
+                }
+            }
         }
-        return `${message.accountId}_${message.ticket}_${message.action}`;
+
+        const orderMap = this.latestEventTimeByOrderKey[mt5AccountId];
+        if (orderMap && orderMap.size > this.maxOrderKeySize) {
+            const excess = orderMap.size - this.maxOrderKeySize;
+            let i = 0;
+            for (const key of orderMap.keys()) {
+                orderMap.delete(key);
+                i++;
+                if (i >= excess) break;
+            }
+        }
     }
 
     /**
@@ -31,27 +93,56 @@ class MessageQueue {
      * @returns {boolean} 是否添加成功
      */
     add(message) {
+        return this.addWithResult(message).accepted;
+    }
+
+    /**
+     * 添加消息并返回详细结果（用于排查被拒原因）
+     * @param {Object} message
+     * @returns {{accepted: boolean, reason: string, detail?: string}}
+     */
+    addWithResult(message) {
         try {
             // 检查消息是否包含账户ID
             if (!message.accountId) {
                 console.error('❌ 消息缺少 accountId 字段，无法添加到队列');
-                return false;
+                return { accepted: false, reason: 'missing_account_id' };
             }
 
             const mt5AccountId = String(message.accountId);
-
-            // 生成消息唯一键，检查是否重复
-            const messageKey = this._getMessageKey(message);
             
-            // 初始化已处理消息记录（如果不存在）
-            if (!this.processedMessages[mt5AccountId]) {
-                this.processedMessages[mt5AccountId] = new Set();
+            // 初始化去重/乱序结构（如果不存在）
+            if (!this.recentFingerprints[mt5AccountId]) {
+                this.recentFingerprints[mt5AccountId] = new Map();
             }
-            
-            // 检查是否已经处理过这条消息（去重）
-            if (this.processedMessages[mt5AccountId].has(messageKey)) {
-                console.warn(`⚠️  重复消息已忽略: [MT5:${mt5AccountId}] ${message.action} ticket:${message.ticket}`);
-                return false; // 重复消息，不添加
+            if (!this.latestEventTimeByOrderKey[mt5AccountId]) {
+                this.latestEventTimeByOrderKey[mt5AccountId] = new Map();
+            }
+            this._cleanupMaps(mt5AccountId);
+
+            const fingerprint = this._getFingerprint(message);
+            const fpMap = this.recentFingerprints[mt5AccountId];
+            const now = Date.now();
+            const existingTs = fpMap.get(fingerprint);
+            if (Number.isFinite(existingTs) && (now - existingTs) <= this.dedupeWindowMs) {
+                return { accepted: false, reason: 'duplicate_event', detail: fingerprint };
+            }
+
+            const incomingEventTimeMs = Number.isFinite(Number(message.eventTimeMs))
+                ? Math.floor(Number(message.eventTimeMs))
+                : null;
+            if (incomingEventTimeMs !== null && incomingEventTimeMs > 0) {
+                const orderKey = this._getOrderKey(message);
+                const orderMap = this.latestEventTimeByOrderKey[mt5AccountId];
+                const latestMs = orderMap.get(orderKey);
+                if (Number.isFinite(latestMs) && incomingEventTimeMs < latestMs) {
+                    return {
+                        accepted: false,
+                        reason: 'out_of_order_event',
+                        detail: `${incomingEventTimeMs}<${latestMs}`
+                    };
+                }
+                orderMap.set(orderKey, incomingEventTimeMs);
             }
 
             // 如果该账户的队列不存在，创建新队列
@@ -72,27 +163,12 @@ class MessageQueue {
 
             // 添加到队列
             this.queues[mt5AccountId].push(message);
+            fpMap.set(fingerprint, now);
             
-            // 记录已处理的消息
-            this.processedMessages[mt5AccountId].add(messageKey);
-            
-            // 限制已处理记录的大小（防止内存溢出）
-            if (this.processedMessages[mt5AccountId].size > this.maxProcessedSize) {
-                // 移除最旧的记录（Set 没有顺序，这里简单处理：清空并重新添加最近的）
-                // 实际场景中，可以考虑使用 LRU 缓存
-                const currentSize = this.processedMessages[mt5AccountId].size;
-                if (currentSize > this.maxProcessedSize) {
-                    // 保留最近的记录，移除最旧的（简化处理：保留一半）
-                    const toKeep = Math.floor(this.maxProcessedSize / 2);
-                    const allKeys = Array.from(this.processedMessages[mt5AccountId]);
-                    this.processedMessages[mt5AccountId] = new Set(allKeys.slice(-toKeep));
-                }
-            }
-            
-            return true;
+            return { accepted: true, reason: 'accepted' };
         } catch (error) {
             console.error('❌ 添加消息到队列失败:', error.message);
-            return false;
+            return { accepted: false, reason: 'queue_error', detail: error.message };
         }
     }
 

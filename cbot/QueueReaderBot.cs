@@ -231,6 +231,8 @@ namespace cAlgo.Robots
                         Print("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] 收到消息 #" + _requestCount);
                         Print("操作类型: " + messageData.Action);
                         Print("订单类型: " + messageData.OrderType);
+                        if (!string.IsNullOrEmpty(messageData.PendingType))
+                            Print("挂单类型: " + messageData.PendingType);
                         Print("交易品种: " + messageData.Symbol);
                         Print("手数: " + messageData.Volume);
                         Print("价格: " + messageData.Price);
@@ -244,7 +246,7 @@ namespace cAlgo.Robots
                             Print("消息时间戳(ms): " + messageData.EventTimeMs.Value);
                         
                         // 检查消息是否过期
-                        if (IsMessageExpired(messageData.EventTimeMs, messageData.Utc8Time))
+                        if (IsMessageExpired(messageData.Action, messageData.EventTimeMs, messageData.Utc8Time))
                         {
                             _expiredCount++;
                             Print("⚠️  消息已过期，丢弃（超过 " + MessageExpireSeconds + " 秒）");
@@ -293,6 +295,7 @@ namespace cAlgo.Robots
         {
             public string Action { get; set; }
             public string OrderType { get; set; }
+            public string PendingType { get; set; }
             public string Symbol { get; set; }
             public double Volume { get; set; }
             public double Price { get; set; }
@@ -324,6 +327,7 @@ namespace cAlgo.Robots
                 
                 data.Action = ExtractStringValue(json, "action");
                 data.OrderType = ExtractStringValue(json, "orderType");
+                data.PendingType = ExtractStringValue(json, "pendingType");
                 data.Symbol = ExtractStringValue(json, "symbol");
                 data.Volume = ExtractDoubleValue(json, "volume");
                 data.Price = ExtractDoubleValue(json, "price");
@@ -368,8 +372,12 @@ namespace cAlgo.Robots
         /// <summary>
         /// 检查消息是否过期
         /// </summary>
-        private bool IsMessageExpired(long? eventTimeMs, string utc8Time)
+        private bool IsMessageExpired(string action, long? eventTimeMs, string utc8Time)
         {
+            // 撤单消息优先保证执行，避免因短暂队列拥塞导致“该撤未撤”
+            if (action == "pending_cancel")
+                return false;
+
             // 统一判定优先使用 UTC 毫秒时间戳，彻底规避经纪商时区差异
             if (eventTimeMs.HasValue && eventTimeMs.Value > 0)
             {
@@ -475,6 +483,18 @@ namespace cAlgo.Robots
                 {
                     ExecuteModifyPosition(message);
                 }
+                else if (message.Action == "pending_open")
+                {
+                    ExecuteOpenPendingOrder(message);
+                }
+                else if (message.Action == "pending_modify")
+                {
+                    ExecuteModifyPendingOrder(message);
+                }
+                else if (message.Action == "pending_cancel")
+                {
+                    ExecuteCancelPendingOrder(message);
+                }
                 else
                 {
                     Print("⚠️  未知的操作类型: " + message.Action);
@@ -494,6 +514,33 @@ namespace cAlgo.Robots
         {
             try
             {
+                // 幂等保护1：同一 MT5 账号 + ticket 的持仓已存在时，跳过重复开仓
+                string expectedLabel = BuildOrderLabel(message);
+                if (!string.IsNullOrEmpty(expectedLabel))
+                {
+                    foreach (var existingPos in Positions)
+                    {
+                        if (existingPos.Label == expectedLabel)
+                        {
+                            // 若该持仓来自挂单触发且保护位未成功落地，借 open 事件补设一次
+                            ApplyPositionProtectionAbsolute(existingPos, message, "重复开仓补设保护位");
+                            Print("ℹ️  检测到重复开仓消息，已跳过（标签已存在）: " + expectedLabel + " | cTrader订单号=" + existingPos.Id);
+                            return;
+                        }
+                    }
+
+                    // 幂等保护2：若同标签挂单仍存在，说明挂单链路尚在进行（可能即将触发）；
+                    // 此时不执行市价开仓，避免“挂单成交 + open消息”双重开仓。
+                    foreach (var existingOrder in PendingOrders)
+                    {
+                        if (existingOrder.Label == expectedLabel)
+                        {
+                            Print("ℹ️  检测到同标签挂单仍存在，跳过open市价开仓以避免重复: " + expectedLabel + " | cTrader挂单ID=" + existingOrder.Id);
+                            return;
+                        }
+                    }
+                }
+
                 // 获取交易品种
                 var symbol = Symbols.GetSymbol(message.Symbol);
                 if (symbol == null)
@@ -621,6 +668,38 @@ namespace cAlgo.Robots
             {
                 _tradeFailCount++;
                 Print("❌ 平仓异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 按绝对价格为持仓补设保护位（用于挂单成交后 open 去重场景）
+        /// </summary>
+        private void ApplyPositionProtectionAbsolute(Position position, MessageData message, string scene)
+        {
+            try
+            {
+                if (position == null || message == null) return;
+                double? newTP = message.TP.HasValue && message.TP.Value > 0 ? message.TP.Value : (double?)null;
+                double? newSL = message.SL.HasValue && message.SL.Value > 0 ? message.SL.Value : (double?)null;
+                if (!newTP.HasValue && !newSL.HasValue) return;
+
+                var modifyResult = ModifyPosition(position, newSL, newTP, ProtectionType.Absolute);
+                if (modifyResult.IsSuccessful)
+                {
+                    if (newTP.HasValue)
+                        Print("   ✅ [" + scene + "] 止盈已设置: " + newTP.Value);
+                    if (newSL.HasValue)
+                        Print("   ✅ [" + scene + "] 止损已设置: " + newSL.Value);
+                }
+                else
+                {
+                    string err = modifyResult.Error.HasValue ? modifyResult.Error.Value.ToString() : "未知错误";
+                    Print("   ⚠️  [" + scene + "] 补设止盈止损失败: " + err);
+                }
+            }
+            catch (Exception ex)
+            {
+                Print("   ⚠️  [" + scene + "] 补设止盈止损异常: " + ex.Message);
             }
         }
 
@@ -996,6 +1075,272 @@ namespace cAlgo.Robots
             {
                 _tradeFailCount++;
                 Print("❌ 修改仓位异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 执行挂单新增（当前先支持限价单）
+        /// </summary>
+        private void ExecuteOpenPendingOrder(MessageData message)
+        {
+            try
+            {
+                string pendingType = !string.IsNullOrEmpty(message.PendingType)
+                    ? message.PendingType.Trim().ToLowerInvariant()
+                    : "limit";
+
+                if (pendingType != "limit" && pendingType != "stop")
+                {
+                    Print("⚠️  暂不支持该挂单类型: " + message.PendingType + "（仅支持 limit/stop）");
+                    return;
+                }
+
+                var symbol = Symbols.GetSymbol(message.Symbol);
+                if (symbol == null)
+                {
+                    _tradeFailCount++;
+                    Print("❌ 找不到交易品种: " + message.Symbol);
+                    return;
+                }
+
+                if (message.Price <= 0)
+                {
+                    _tradeFailCount++;
+                    Print("❌ 限价单价格无效: " + message.Price);
+                    return;
+                }
+
+                TradeType tradeType;
+                if (!TryGetTradeType(message.OrderType, out tradeType))
+                {
+                    _tradeFailCount++;
+                    Print("❌ 未知的订单方向: " + message.OrderType);
+                    return;
+                }
+
+                double volumeToUse = FixedVolume > 0 ? FixedVolume : message.Volume;
+                if (volumeToUse <= 0)
+                {
+                    _tradeFailCount++;
+                    Print("❌ 挂单手数无效: " + volumeToUse);
+                    return;
+                }
+
+                double volumeInUnits = symbol.QuantityToVolumeInUnits(volumeToUse);
+                string label = BuildOrderLabel(message);
+
+                TradeResult result;
+                if (pendingType == "stop")
+                {
+                    // 第一步：仅创建挂单，避免下单接口对保护位参数语义（价格/点数）存在歧义
+                    result = PlaceStopOrder(tradeType, symbol.Name, volumeInUnits, message.Price, label);
+                }
+                else
+                {
+                    // 第一步：仅创建挂单，避免下单接口对保护位参数语义（价格/点数）存在歧义
+                    result = PlaceLimitOrder(tradeType, symbol.Name, volumeInUnits, message.Price, label);
+                }
+
+                if (result.IsSuccessful)
+                {
+                    _tradeSuccessCount++;
+                    string orderTypeText = pendingType == "stop" ? "止损挂单" : "限价挂单";
+                    Print("✅ " + orderTypeText + "创建成功: " + tradeType + " " + symbol.Name + " @ " + message.Price);
+                    Print("   标签: " + label);
+
+                    // 第二步：显式按绝对价格写入保护位，彻底消除价格/点数语义混淆
+                    ApplyPendingProtectionAbsolute(message);
+                }
+                else
+                {
+                    _tradeFailCount++;
+                    string errorMsg = result.Error.HasValue ? result.Error.Value.ToString() : "未知错误";
+                    Print("❌ 挂单创建失败(" + pendingType + "): " + errorMsg);
+                }
+            }
+            catch (Exception ex)
+            {
+                _tradeFailCount++;
+                Print("❌ 创建挂单异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 执行挂单修改：通过撤单再下新单实现（确保与 MT5 最新价格一致）
+        /// </summary>
+        private void ExecuteModifyPendingOrder(MessageData message)
+        {
+            try
+            {
+                // 改挂单必须严格按标签命中，禁止品种+方向兼容匹配（会误命中其他ticket）
+                var existingOrder = FindPendingOrderByMessageIdentity(message, "改挂单", false);
+                if (existingOrder == null)
+                {
+                    // 若同标签持仓已存在，说明该挂单已触发成交；此时忽略 modify，避免重建新挂单
+                    string exactLabel = BuildOrderLabel(message);
+                    if (!string.IsNullOrEmpty(exactLabel))
+                    {
+                        foreach (var pos in Positions)
+                        {
+                            if (pos.Label == exactLabel)
+                            {
+                                Print("ℹ️  改挂单已忽略：同标签持仓已存在（挂单已触发）: " + exactLabel + " | cTrader订单号=" + pos.Id);
+                                return;
+                            }
+                        }
+                    }
+                    Print("⚠️  改挂单：未找到对应挂单（严格匹配）");
+                    return;
+                }
+
+                var cancelResult = CancelPendingOrder(existingOrder);
+                if (!cancelResult.IsSuccessful)
+                {
+                    _tradeFailCount++;
+                    string cancelError = cancelResult.Error.HasValue ? cancelResult.Error.Value.ToString() : "未知错误";
+                    Print("❌ 改挂单失败（撤销旧单失败）: " + cancelError);
+                    return;
+                }
+
+                Print("✅ 已撤销旧挂单，开始按新参数重建");
+                ExecuteOpenPendingOrder(message);
+            }
+            catch (Exception ex)
+            {
+                _tradeFailCount++;
+                Print("❌ 修改挂单异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 执行挂单撤销
+        /// </summary>
+        private void ExecuteCancelPendingOrder(MessageData message)
+        {
+            try
+            {
+                var existingOrder = FindPendingOrderByMessageIdentity(message, "撤挂单", true);
+                if (existingOrder == null)
+                {
+                    Print("⚠️  撤挂单：未找到对应挂单");
+                    return;
+                }
+
+                var cancelResult = CancelPendingOrder(existingOrder);
+                if (cancelResult.IsSuccessful)
+                {
+                    _tradeSuccessCount++;
+                    Print("✅ 挂单撤销成功");
+                }
+                else
+                {
+                    _tradeFailCount++;
+                    string cancelError = cancelResult.Error.HasValue ? cancelResult.Error.Value.ToString() : "未知错误";
+                    Print("❌ 挂单撤销失败: " + cancelError);
+                }
+            }
+            catch (Exception ex)
+            {
+                _tradeFailCount++;
+                Print("❌ 撤销挂单异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 将 buy/sell 文本转换为 cTrader TradeType
+        /// </summary>
+        private bool TryGetTradeType(string orderType, out TradeType tradeType)
+        {
+            tradeType = TradeType.Buy;
+            if (orderType == "buy")
+            {
+                tradeType = TradeType.Buy;
+                return true;
+            }
+            if (orderType == "sell")
+            {
+                tradeType = TradeType.Sell;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 按消息身份查找挂单（优先标签精确匹配）
+        /// </summary>
+        private PendingOrder FindPendingOrderByMessageIdentity(MessageData message, string purpose, bool allowFallback)
+        {
+            if (message == null) return null;
+
+            string exactLabel = BuildOrderLabel(message);
+            if (!string.IsNullOrEmpty(exactLabel))
+            {
+                foreach (var order in PendingOrders)
+                {
+                    if (order.Label == exactLabel)
+                    {
+                        Print("   [" + purpose + "] 标签匹配命中挂单: cTrader订单号=" + order.Id + ", 标签=" + order.Label);
+                        return order;
+                    }
+                }
+            }
+
+            if (allowFallback)
+            {
+                TradeType tradeType;
+                if (TryGetTradeType(message.OrderType, out tradeType))
+                {
+                    foreach (var order in PendingOrders)
+                    {
+                        if (order.SymbolName == message.Symbol && order.TradeType == tradeType)
+                        {
+                            Print("   ⚠️  [" + purpose + "] 兼容匹配命中挂单: cTrader订单号=" + order.Id + ", 标签=" + order.Label);
+                            return order;
+                        }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 为挂单写入止损止盈（绝对价格）
+        /// </summary>
+        private void ApplyPendingProtectionAbsolute(MessageData message)
+        {
+            try
+            {
+                if (message == null) return;
+                double? stopLoss = message.SL.HasValue && message.SL.Value > 0 ? message.SL.Value : (double?)null;
+                double? takeProfit = message.TP.HasValue && message.TP.Value > 0 ? message.TP.Value : (double?)null;
+                if (!stopLoss.HasValue && !takeProfit.HasValue)
+                    return;
+
+                var order = FindPendingOrderByMessageIdentity(message, "设置挂单保护位", false);
+                if (order == null)
+                {
+                    Print("⚠️  挂单已创建，但未找到可设置保护位的挂单");
+                    return;
+                }
+
+                var modifyResult = ModifyPendingOrder(order, order.TargetPrice, stopLoss, takeProfit, ProtectionType.Absolute);
+                if (modifyResult.IsSuccessful)
+                {
+                    if (stopLoss.HasValue)
+                        Print("   ✅ 挂单止损已设置(价格): " + stopLoss.Value);
+                    if (takeProfit.HasValue)
+                        Print("   ✅ 挂单止盈已设置(价格): " + takeProfit.Value);
+                }
+                else
+                {
+                    string errorMsg = modifyResult.Error.HasValue ? modifyResult.Error.Value.ToString() : "未知错误";
+                    Print("⚠️  挂单创建成功，但设置保护位失败: " + errorMsg);
+                }
+            }
+            catch (Exception ex)
+            {
+                Print("⚠️  挂单创建成功，但设置保护位异常: " + ex.Message);
             }
         }
 

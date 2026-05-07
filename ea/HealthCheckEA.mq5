@@ -20,6 +20,42 @@ int successCount = 0;  // 成功计数
 int failCount = 0;     // 失败计数
 ulong processedDeals[];  // 已处理的成交单列表（用于去重）
 datetime lastPositionReportTime = 0;  // 上次仓位上报时间
+ulong trackedPendingTickets[]; // 已观测到的挂单ticket（用于删除事件兜底）
+
+bool IsTrackedPendingTicket(ulong ticket)
+{
+    int n = ArraySize(trackedPendingTickets);
+    for(int i = 0; i < n; i++)
+    {
+        if(trackedPendingTickets[i] == ticket)
+            return true;
+    }
+    return false;
+}
+
+void TrackPendingTicket(ulong ticket)
+{
+    if(ticket == 0) return;
+    if(IsTrackedPendingTicket(ticket)) return;
+    int n = ArraySize(trackedPendingTickets);
+    ArrayResize(trackedPendingTickets, n + 1);
+    trackedPendingTickets[n] = ticket;
+}
+
+void UntrackPendingTicket(ulong ticket)
+{
+    int n = ArraySize(trackedPendingTickets);
+    for(int i = 0; i < n; i++)
+    {
+        if(trackedPendingTickets[i] == ticket)
+        {
+            for(int j = i; j < n - 1; j++)
+                trackedPendingTickets[j] = trackedPendingTickets[j + 1];
+            ArrayResize(trackedPendingTickets, n - 1);
+            return;
+        }
+    }
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -90,6 +126,157 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
+    // 处理挂单事件（新增/修改/删除），用于同步 MT5 限价单到 cTrader
+    if(trans.type == TRADE_TRANSACTION_ORDER_ADD ||
+       trans.type == TRADE_TRANSACTION_ORDER_UPDATE ||
+       trans.type == TRADE_TRANSACTION_ORDER_DELETE)
+    {
+        ulong orderTicket = trans.order;
+        if(orderTicket > 0)
+        {
+            bool isDeleteEvent = (trans.type == TRADE_TRANSACTION_ORDER_DELETE);
+            bool selected = false;
+            ENUM_ORDER_TYPE orderKind = ORDER_TYPE_BUY;
+            ENUM_ORDER_STATE orderState = ORDER_STATE_STARTED;
+            string symbol = "";
+            double volume = 0;
+            double price = 0;
+            double sl = 0;
+            double tp = 0;
+            // 事件时间：优先使用订单自身时间，最后再兜底到当前时间（秒转毫秒）
+            // 注意：MqlTradeTransaction 在当前环境无 time_msc 字段
+            long eventTimeMs = 0;
+            string comment = "";
+
+            // 新增/修改优先从当前挂单读取；删除事件通常在历史订单里
+            if(!isDeleteEvent && OrderSelect(orderTicket))
+            {
+                selected = true;
+                orderKind = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                orderState = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+                symbol = OrderGetString(ORDER_SYMBOL);
+                volume = OrderGetDouble(ORDER_VOLUME_CURRENT);
+                price = OrderGetDouble(ORDER_PRICE_OPEN);
+                sl = OrderGetDouble(ORDER_SL);
+                tp = OrderGetDouble(ORDER_TP);
+                // 时间戳策略：
+                // - ORDER_ADD：可用 setup 时间
+                // - ORDER_UPDATE：必须使用“当前事件时间”，避免后期改SL/TP仍携带建单时间导致过期
+                if(trans.type == TRADE_TRANSACTION_ORDER_UPDATE)
+                    eventTimeMs = (long)TimeCurrent() * 1000;
+                else
+                    eventTimeMs = (long)OrderGetInteger(ORDER_TIME_SETUP_MSC);
+                comment = OrderGetString(ORDER_COMMENT);
+            }
+
+            if(!selected && HistoryOrderSelect(orderTicket))
+            {
+                selected = true;
+                orderKind = (ENUM_ORDER_TYPE)HistoryOrderGetInteger(orderTicket, ORDER_TYPE);
+                orderState = (ENUM_ORDER_STATE)HistoryOrderGetInteger(orderTicket, ORDER_STATE);
+                symbol = HistoryOrderGetString(orderTicket, ORDER_SYMBOL);
+                volume = HistoryOrderGetDouble(orderTicket, ORDER_VOLUME_CURRENT);
+                price = HistoryOrderGetDouble(orderTicket, ORDER_PRICE_OPEN);
+                sl = HistoryOrderGetDouble(orderTicket, ORDER_SL);
+                tp = HistoryOrderGetDouble(orderTicket, ORDER_TP);
+                // 删除事件优先使用成交/撤销完成时间；仍不可用再回退创建时间
+                eventTimeMs = (long)HistoryOrderGetInteger(orderTicket, ORDER_TIME_DONE_MSC);
+                if(eventTimeMs <= 0)
+                    eventTimeMs = (long)HistoryOrderGetInteger(orderTicket, ORDER_TIME_SETUP_MSC);
+                comment = HistoryOrderGetString(orderTicket, ORDER_COMMENT);
+            }
+
+            // 删除事件兜底：当订单池/历史池暂时读不到详情时，若请求动作为 REMOVE，
+            // 说明这是明确的“撤挂单”，仍应下发 pending_cancel；否则忽略以避免误报。
+            if(isDeleteEvent && !selected)
+            {
+                bool likelyCancelByRequest = (request.action == TRADE_ACTION_REMOVE);
+                bool likelyKnownPending = IsTrackedPendingTicket(orderTicket);
+                if(!likelyCancelByRequest && !likelyKnownPending)
+                    return;
+
+                if(eventTimeMs <= 0)
+                    eventTimeMs = (long)TimeCurrent() * 1000;
+                SendTradeInfo("pending_cancel", "", "", 0, 0, 0, 0, (long)orderTicket, "", 0, eventTimeMs, "");
+                UntrackPendingTicket(orderTicket);
+                return;
+            }
+
+            if(selected)
+            {
+                string orderType = "";
+                string pendingType = "";
+
+                if(orderKind == ORDER_TYPE_BUY_LIMIT)
+                {
+                    orderType = "buy";
+                    pendingType = "limit";
+                }
+                else if(orderKind == ORDER_TYPE_SELL_LIMIT)
+                {
+                    orderType = "sell";
+                    pendingType = "limit";
+                }
+                else if(orderKind == ORDER_TYPE_BUY_STOP)
+                {
+                    orderType = "buy";
+                    pendingType = "stop";
+                }
+                else if(orderKind == ORDER_TYPE_SELL_STOP)
+                {
+                    orderType = "sell";
+                    pendingType = "stop";
+                }
+                else
+                {
+                    // 删除事件在类型不可识别时，若该ticket曾是挂单，仍按撤挂单处理，防漏撤
+                    if(isDeleteEvent && IsTrackedPendingTicket(orderTicket))
+                    {
+                        if(eventTimeMs <= 0)
+                            eventTimeMs = (long)TimeCurrent() * 1000;
+                        SendTradeInfo("pending_cancel", "", symbol, volume, price, sl, tp, (long)orderTicket, comment, 0, eventTimeMs, "");
+                        UntrackPendingTicket(orderTicket);
+                        return;
+                    }
+                    // 非挂单类型（如市价单）不在挂单同步链路处理
+                    return;
+                }
+
+                // 已识别为挂单类型，纳入本地跟踪，供删除事件兜底使用
+                TrackPendingTicket(orderTicket);
+
+                // 成交删除（FILLED）不下发 pending_cancel，避免和 open 事件重复
+                if(isDeleteEvent && orderState == ORDER_STATE_FILLED)
+                {
+                    UntrackPendingTicket(orderTicket);
+                    return;
+                }
+
+                string pendingAction = "pending_open";
+                if(trans.type == TRADE_TRANSACTION_ORDER_UPDATE)
+                {
+                    // 关键修正：有些券商在手动撤单时先推 ORDER_UPDATE 且状态已是 CANCELED/EXPIRED，
+                    // 若仍按 modify 处理会导致 cTrader 端“撤单变改挂单”。
+                    if(orderState == ORDER_STATE_CANCELED || orderState == ORDER_STATE_EXPIRED || orderState == ORDER_STATE_REJECTED)
+                        pendingAction = "pending_cancel";
+                    else
+                        pendingAction = "pending_modify";
+                }
+                else if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
+                    pendingAction = "pending_cancel";
+
+                if(eventTimeMs <= 0)
+                    eventTimeMs = (long)TimeCurrent() * 1000;
+
+                SendTradeInfo(pendingAction, orderType, symbol, volume, price, sl, tp,
+                              (long)orderTicket, comment, 0, eventTimeMs, pendingType);
+                if(pendingAction == "pending_cancel")
+                    UntrackPendingTicket(orderTicket);
+            }
+        }
+        return;
+    }
+
     // 处理仓位修改事件
     if(trans.type == TRADE_TRANSACTION_POSITION)
     {
@@ -112,7 +299,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             // 发送修改信息到服务器
             // modify 操作使用 positionId 作为 ticket
             long eventTimeMs = (long)PositionGetInteger(POSITION_TIME_UPDATE_MSC);
-            SendTradeInfo("modify", orderType, symbol, 0, 0, sl, tp, ticket, "", 0, eventTimeMs);
+            SendTradeInfo("modify", orderType, symbol, 0, 0, sl, tp, ticket, "", 0, eventTimeMs, "");
         }
         return;
     }
@@ -201,7 +388,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     // 发送交易信息到服务器
     // 注意：使用 positionId 而不是 dealTicket，因为开仓和平仓的 dealTicket 不同，但 positionId 相同
     long eventTimeMs = (long)HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
-    SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)positionId, comment, (long)dealTicket, eventTimeMs);
+    SendTradeInfo(action, orderType, symbol, volume, price, sl, tp, (long)positionId, comment, (long)dealTicket, eventTimeMs, "");
     
     // 开仓或平仓后立即上报仓位信息（不等待定时器）
     SendPositionReport();
@@ -213,7 +400,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 //+------------------------------------------------------------------+
 void SendTradeInfo(string action, string orderType, string symbol, 
                    double volume, double price, double sl, double tp, 
-                   long positionId, string comment, long dealTicket, long eventTimeMs)
+                   long positionId, string comment, long dealTicket, long eventTimeMs, string pendingType = "")
 {
     // 获取账户ID
     long accountId = AccountInfoInteger(ACCOUNT_LOGIN);
@@ -240,6 +427,8 @@ void SendTradeInfo(string action, string orderType, string symbol,
         json += ",\"dealTicket\":" + IntegerToString(dealTicket);
     if(comment != "")
         json += ",\"comment\":\"" + comment + "\"";
+    if(pendingType != "")
+        json += ",\"pendingType\":\"" + pendingType + "\"";
     
     json += ",\"timestamp\":\"" + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS) + "\"";
     if(eventTimeMs > 0)
