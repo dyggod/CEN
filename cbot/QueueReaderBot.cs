@@ -1,6 +1,7 @@
 using System;
 using System.Net.Http;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using cAlgo.API;
 
@@ -31,6 +32,9 @@ namespace cAlgo.Robots
         [Parameter("仓位检查标的", DefaultValue = "XAUUSD")]
         public string CheckSymbols { get; set; }
 
+        [Parameter("市价开仓异步提交", DefaultValue = true)]
+        public bool AsyncMarketOpen { get; set; }
+
         // 私有变量
         private HttpClient _httpClient;
         private long _accountId = 0;  // 账户ID（在主线程中获取）
@@ -42,6 +46,10 @@ namespace cAlgo.Robots
         private int _tradeFailCount = 0;  // 交易失败计数
         private DateTime _lastLeaseCycleEndUtc = DateTime.MinValue;
         private volatile bool _leaseCycleBusy;
+        /// <summary>异步开仓进行中：同 pendingKey 不重复提交（避免成交前二次通过幂等检查）</summary>
+        private readonly object _openPendingLock = new object();
+        private readonly System.Collections.Generic.HashSet<string> _openPendingKeys =
+            new System.Collections.Generic.HashSet<string>(System.StringComparer.Ordinal);
         /// <summary>各 MT5 账号最近一次仓位同步成功平掉至少一单的时间（UTC），用于解释紧随其后的队列 close/modify 找不到持仓</summary>
         private readonly System.Collections.Generic.Dictionary<string, DateTime> _lastAccountSyncCloseUtc =
             new System.Collections.Generic.Dictionary<string, DateTime>(System.StringComparer.Ordinal);
@@ -55,15 +63,16 @@ namespace cAlgo.Robots
             _httpClient = new HttpClient();
             _httpClient.Timeout = TimeSpan.FromSeconds(5);
 
-            double timerSec = Math.Max(0.05, RequestIntervalMs / 1000.0);
-            Timer.Start(timerSec);
+            int tickMs = Math.Max(50, RequestIntervalMs);
+            Timer.Start(TimeSpan.FromMilliseconds(tickMs));
 
             Print("Queue Reader Bot 已启动");
             Print("服务器地址: " + ServerURL);
             Print("当前账户ID: " + _accountId);
-            Print("轮询间隔: " + RequestIntervalMs + " ms（定时器 " + timerSec + " s）");
+            Print("轮询间隔: " + RequestIntervalMs + " ms（定时器 Tick " + tickMs + " ms）");
             Print("单次租约条数上限: " + LeaseBatchLimit);
             Print("Lease TTL(ms): " + LeaseTtlMs);
+            Print("市价开仓: " + (AsyncMarketOpen ? "异步提交 (ExecuteMarketOrderAsync)" : "同步 (ExecuteMarketOrder)"));
             Print("消息过期时间: " + MessageExpireSeconds + " 秒");
             if (FixedVolume > 0)
                 Print("固定手数: " + FixedVolume + " 手（将忽略消息中的手数）");
@@ -673,40 +682,78 @@ namespace cAlgo.Robots
         }
 
         /// <summary>
-        /// 执行开仓操作
+        /// 异步开仓去重键：标签非通用 QueueBot 时用标签；否则用品种+方向+MT5字段组合，避免成交前重复提交。
+        /// </summary>
+        private static string MakeOpenPendingKey(string orderLabel, MessageData message, TradeType tradeType)
+        {
+            if (!string.IsNullOrEmpty(orderLabel) && orderLabel != "QueueBot")
+                return orderLabel;
+            long ticket = message.Ticket.HasValue ? message.Ticket.Value : 0;
+            long evt = message.EventTimeMs.HasValue ? message.EventTimeMs.Value : 0;
+            return "QueueBot|" + (message.Symbol ?? "") + "|" + tradeType + "|" + ticket + "|" + evt;
+        }
+
+        /// <summary>
+        /// 市价开仓成交后设置绝对 TP/SL（与同步路径一致）
+        /// </summary>
+        private void ApplySlTpAfterMarketOpen(Position opened, MessageData message)
+        {
+            if (opened == null || message == null)
+                return;
+            if (!message.TP.HasValue && !message.SL.HasValue)
+                return;
+
+            Print("   正在设置止盈/止损...");
+            double? newTP = message.TP.HasValue ? message.TP.Value : (double?)null;
+            double? newSL = message.SL.HasValue ? message.SL.Value : (double?)null;
+
+            var modifyResult = ModifyPosition(opened, newSL, newTP, ProtectionType.Absolute);
+
+            if (modifyResult.IsSuccessful)
+            {
+                if (newTP.HasValue)
+                    Print("   ✅ 止盈已设置: " + newTP.Value);
+                if (newSL.HasValue)
+                    Print("   ✅ 止损已设置: " + newSL.Value);
+            }
+            else
+            {
+                string errorMsg = modifyResult.Error.HasValue ? modifyResult.Error.Value.ToString() : "未知错误";
+                Print("   ⚠️  设置止盈/止损失败: " + errorMsg);
+                Print("   请手动检查并设置止盈/止损");
+            }
+        }
+
+        /// <summary>
+        /// 执行开仓操作（可选异步：不等待上一笔成交再提交下一笔）
         /// </summary>
         private void ExecuteOpenPosition(MessageData message)
         {
             try
             {
-                // 幂等保护1：同一 MT5 账号 + ticket 的持仓已存在时，跳过重复开仓
-                string expectedLabel = BuildOrderLabel(message);
-                if (!string.IsNullOrEmpty(expectedLabel))
+                string orderLabel = BuildOrderLabel(message);
+                if (!string.IsNullOrEmpty(orderLabel))
                 {
                     foreach (var existingPos in Positions)
                     {
-                        if (existingPos.Label == expectedLabel)
+                        if (existingPos.Label == orderLabel)
                         {
-                            // 若该持仓来自挂单触发且保护位未成功落地，借 open 事件补设一次
                             ApplyPositionProtectionAbsolute(existingPos, message, "重复开仓补设保护位");
-                            Print("ℹ️  检测到重复开仓消息，已跳过（标签已存在）: " + expectedLabel + " | cTrader订单号=" + existingPos.Id);
+                            Print("ℹ️  检测到重复开仓消息，已跳过（标签已存在）: " + orderLabel + " | cTrader订单号=" + existingPos.Id);
                             return;
                         }
                     }
 
-                    // 幂等保护2：若同标签挂单仍存在，说明挂单链路尚在进行（可能即将触发）；
-                    // 此时不执行市价开仓，避免“挂单成交 + open消息”双重开仓。
                     foreach (var existingOrder in PendingOrders)
                     {
-                        if (existingOrder.Label == expectedLabel)
+                        if (existingOrder.Label == orderLabel)
                         {
-                            Print("ℹ️  检测到同标签挂单仍存在，跳过open市价开仓以避免重复: " + expectedLabel + " | cTrader挂单ID=" + existingOrder.Id);
+                            Print("ℹ️  检测到同标签挂单仍存在，跳过open市价开仓以避免重复: " + orderLabel + " | cTrader挂单ID=" + existingOrder.Id);
                             return;
                         }
                     }
                 }
 
-                // 获取交易品种
                 var symbol = Symbols.GetSymbol(message.Symbol);
                 if (symbol == null)
                 {
@@ -715,7 +762,6 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                // 确定交易方向
                 TradeType tradeType;
                 if (message.OrderType == "buy")
                     tradeType = TradeType.Buy;
@@ -728,62 +774,94 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                // 确定使用的手数：如果设置了固定手数，则使用固定手数；否则使用消息中的手数
                 double volumeToUse = FixedVolume > 0 ? FixedVolume : message.Volume;
-                
-                // 计算手数（转换为cTrader的单位，手数转为基础单位）
                 double volumeInUnits = symbol.QuantityToVolumeInUnits(volumeToUse);
 
-                // 构建标签：优先包含 MT5 账号 + Position ID，兼容老格式
-                string label = BuildOrderLabel(message);
-                
-                // 先执行开仓（不设置TP/SL，因为可能不准确），标签中包含 MT5 Position ID
-                var result = ExecuteMarketOrder(tradeType, symbol.Name, volumeInUnits, label);
-
-                if (result.IsSuccessful && result.Position != null)
+                if (AsyncMarketOpen)
                 {
-                    _tradeSuccessCount++;
-                    string volumeInfo = FixedVolume > 0 
-                        ? volumeToUse + "手（固定手数，消息中为" + message.Volume + "手）" 
-                        : volumeToUse + "手";
-                    Print("✅ 开仓成功: " + tradeType + " " + message.Symbol + " " + volumeInfo);
-                    Print("   cTrader订单号: " + result.Position.Id);
-                    Print("   标签: " + label);
-                    if (!string.IsNullOrEmpty(message.MT5Account))
-                        Print("   MT5账号: " + message.MT5Account);
-                    if (message.Ticket.HasValue)
-                        Print("   MT5 Position ID: " + message.Ticket.Value + " (已写入标签)");
-                    
-                    // 开仓成功后，立即修改TP/SL为正确值
-                    if (message.TP.HasValue || message.SL.HasValue)
+                    string pendingKey = MakeOpenPendingKey(orderLabel, message, tradeType);
+                    lock (_openPendingLock)
                     {
-                        Print("   正在设置止盈/止损...");
-                        double? newTP = message.TP.HasValue ? message.TP.Value : (double?)null;
-                        double? newSL = message.SL.HasValue ? message.SL.Value : (double?)null;
-                        
-                        // 使用新的 ModifyPosition 方法（带 ProtectionType 参数）
-                        var modifyResult = ModifyPosition(result.Position, newSL, newTP, ProtectionType.Absolute);
-                        
-                        if (modifyResult.IsSuccessful)
+                        if (_openPendingKeys.Contains(pendingKey))
                         {
-                            if (newTP.HasValue)
-                                Print("   ✅ 止盈已设置: " + newTP.Value);
-                            if (newSL.HasValue)
-                                Print("   ✅ 止损已设置: " + newSL.Value);
+                            Print("ℹ️  同笔开仓已在提交中，跳过重复提交: " + pendingKey);
+                            return;
                         }
-                        else
+                        _openPendingKeys.Add(pendingKey);
+                    }
+
+                    try
+                    {
+                        ExecuteMarketOrderAsync(tradeType, symbol.Name, volumeInUnits, orderLabel, (TradeResult r) =>
                         {
-                            string errorMsg = modifyResult.Error.HasValue ? modifyResult.Error.Value.ToString() : "未知错误";
-                            Print("   ⚠️  设置止盈/止损失败: " + errorMsg);
-                            Print("   请手动检查并设置止盈/止损");
-                        }
+                            BeginInvokeOnMainThread(() =>
+                            {
+                                try
+                                {
+                                    if (r.IsSuccessful && r.Position != null)
+                                    {
+                                        _tradeSuccessCount++;
+                                        string volumeInfo = FixedVolume > 0
+                                            ? volumeToUse + "手（固定手数，消息中为" + message.Volume + "手）"
+                                            : volumeToUse + "手";
+                                        Print("✅ 开仓成功(异步): " + tradeType + " " + message.Symbol + " " + volumeInfo);
+                                        Print("   cTrader订单号: " + r.Position.Id);
+                                        Print("   标签: " + orderLabel);
+                                        if (!string.IsNullOrEmpty(message.MT5Account))
+                                            Print("   MT5账号: " + message.MT5Account);
+                                        if (message.Ticket.HasValue)
+                                            Print("   MT5 Position ID: " + message.Ticket.Value + " (已写入标签)");
+
+                                        ApplySlTpAfterMarketOpen(r.Position, message);
+                                    }
+                                    else
+                                    {
+                                        _tradeFailCount++;
+                                        string errorMsg = r.Error.HasValue ? r.Error.Value.ToString() : "未知错误";
+                                        Print("❌ 开仓失败(异步): " + errorMsg);
+                                    }
+                                }
+                                finally
+                                {
+                                    lock (_openPendingLock)
+                                        _openPendingKeys.Remove(pendingKey);
+                                }
+                            });
+                        });
+                    }
+                    catch (Exception)
+                    {
+                        lock (_openPendingLock)
+                            _openPendingKeys.Remove(pendingKey);
+                        throw;
                     }
                 }
                 else
                 {
-                    _tradeFailCount++;
-                    string errorMsg = result.Error.HasValue ? result.Error.Value.ToString() : "未知错误";
-                    Print("❌ 开仓失败: " + errorMsg);
+                    var result = ExecuteMarketOrder(tradeType, symbol.Name, volumeInUnits, orderLabel);
+
+                    if (result.IsSuccessful && result.Position != null)
+                    {
+                        _tradeSuccessCount++;
+                        string volumeInfo = FixedVolume > 0
+                            ? volumeToUse + "手（固定手数，消息中为" + message.Volume + "手）"
+                            : volumeToUse + "手";
+                        Print("✅ 开仓成功: " + tradeType + " " + message.Symbol + " " + volumeInfo);
+                        Print("   cTrader订单号: " + result.Position.Id);
+                        Print("   标签: " + orderLabel);
+                        if (!string.IsNullOrEmpty(message.MT5Account))
+                            Print("   MT5账号: " + message.MT5Account);
+                        if (message.Ticket.HasValue)
+                            Print("   MT5 Position ID: " + message.Ticket.Value + " (已写入标签)");
+
+                        ApplySlTpAfterMarketOpen(result.Position, message);
+                    }
+                    else
+                    {
+                        _tradeFailCount++;
+                        string errorMsg = result.Error.HasValue ? result.Error.Value.ToString() : "未知错误";
+                        Print("❌ 开仓失败: " + errorMsg);
+                    }
                 }
             }
             catch (Exception ex)
@@ -893,22 +971,72 @@ namespace cAlgo.Robots
         }
 
         /// <summary>
-        /// 平仓所有持仓
+        /// 对快照中的持仓并发提交异步关仓（ClosePositionAsync），不等待上一笔完成再发下一笔。
+        /// 结果回调经 BeginInvokeOnMainThread，避免跨线程访问 Robot 状态。
+        /// </summary>
+        private void ClosePositionListAsyncBurst(
+            System.Collections.Generic.List<Position> list,
+            string logPrefix,
+            bool setAccountSyncUtc,
+            string mt5AccountForUtc)
+        {
+            if (list == null || list.Count == 0)
+                return;
+
+            int total = list.Count;
+            int succeeded = 0;
+            int completed = 0;
+
+            foreach (var position in list)
+            {
+                long posId = position.Id;
+                string sym = position.SymbolName ?? "";
+                TradeType tt = position.TradeType;
+
+                ClosePositionAsync(position, (TradeResult r) =>
+                {
+                    BeginInvokeOnMainThread(() =>
+                    {
+                        if (r.IsSuccessful)
+                        {
+                            Interlocked.Increment(ref succeeded);
+                            Print("✅ " + logPrefix + " 异步平仓成功: " + sym + " " + tt + " cId=" + posId);
+                        }
+                        else
+                        {
+                            string err = r.Error.HasValue ? r.Error.Value.ToString() : "?";
+                            Print("❌ " + logPrefix + " 异步平仓失败: " + sym + " err=" + err);
+                        }
+
+                        if (Interlocked.Increment(ref completed) == total)
+                        {
+                            int okCount = Volatile.Read(ref succeeded);
+                            if (okCount > 0)
+                            {
+                                _tradeSuccessCount++;
+                                Print("✅ " + logPrefix + " 本轮异步关仓结束，成功 " + okCount + " / " + total);
+                                if (setAccountSyncUtc && !string.IsNullOrEmpty(mt5AccountForUtc))
+                                    _lastAccountSyncCloseUtc[mt5AccountForUtc.Trim()] = DateTime.UtcNow;
+                            }
+                            else
+                            {
+                                Print("❌ " + logPrefix + " 本轮异步关仓全部失败（0/" + total + "）");
+                            }
+                        }
+                    });
+                });
+            }
+        }
+
+        /// <summary>
+        /// 平仓所有持仓（异步并发提交关仓）
         /// </summary>
         private void CloseAllPositions()
         {
-            int closedCount = 0;
+            var list = new System.Collections.Generic.List<Position>();
             foreach (var position in Positions)
-            {
-                var result = ClosePosition(position);
-                if (result.IsSuccessful)
-                    closedCount++;
-            }
-            if (closedCount > 0)
-            {
-                _tradeSuccessCount++;
-                Print("✅ 已平仓 " + closedCount + " 个持仓");
-            }
+                list.Add(position);
+            ClosePositionListAsyncBurst(list, "[全平]", false, null);
         }
 
         /// <summary>
@@ -918,7 +1046,7 @@ namespace cAlgo.Robots
         private void CloseAllPositionsForSymbols(System.Collections.Generic.List<string> symbols)
         {
             if (symbols == null || symbols.Count == 0) return;
-            int closedCount = 0;
+            var list = new System.Collections.Generic.List<Position>();
             foreach (var position in Positions)
             {
                 if (string.IsNullOrEmpty(position.SymbolName)) continue;
@@ -935,29 +1063,19 @@ namespace cAlgo.Robots
                     }
                 }
                 if (!match) continue;
-                var result = ClosePosition(position);
-                if (result.IsSuccessful)
-                {
-                    closedCount++;
-                    Print("✅ [仓位同步] 已平仓: " + position.SymbolName + " " + position.TradeType + " 订单号 " + position.Id);
-                }
-                else
-                {
-                    Print("❌ [仓位同步] 平仓失败: " + position.SymbolName + " " + result.Error);
-                }
+                list.Add(position);
             }
-            if (closedCount > 0)
-                _tradeSuccessCount++;
+            ClosePositionListAsyncBurst(list, "[仓位同步]", false, null);
         }
 
         /// <summary>
-        /// 平掉指定 MT5 账号 + 指定标的的仓位（仅处理 QueueBot 开的仓）
+        /// 平掉指定 MT5 账号 + 指定标的的仓位（仅处理 QueueBot 开的仓）；异步并发关仓。
         /// </summary>
         private void CloseAllPositionsForAccountSymbols(string mt5Account, System.Collections.Generic.List<string> symbols)
         {
             if (string.IsNullOrEmpty(mt5Account) || symbols == null || symbols.Count == 0) return;
             string account = mt5Account.Trim();
-            int closedCount = 0;
+            var list = new System.Collections.Generic.List<Position>();
             foreach (var position in Positions)
             {
                 if (string.IsNullOrEmpty(position.SymbolName)) continue;
@@ -967,7 +1085,7 @@ namespace cAlgo.Robots
 
                 string labelAccount;
                 if (!TryExtractMt5AccountFromLabel(position.Label, out labelAccount))
-                    continue; // 无账号标签的旧仓位，不参与账号维度同步平仓
+                    continue;
 
                 if (!labelAccount.Equals(account, System.StringComparison.Ordinal))
                     continue;
@@ -983,23 +1101,9 @@ namespace cAlgo.Robots
                     }
                 }
                 if (!match) continue;
-
-                var result = ClosePosition(position);
-                if (result.IsSuccessful)
-                {
-                    closedCount++;
-                    Print("✅ [仓位同步-按账号] 已平仓: MT5账号=" + account + " " + position.SymbolName + " " + position.TradeType + " 订单号 " + position.Id);
-                }
-                else
-                {
-                    Print("❌ [仓位同步-按账号] 平仓失败: MT5账号=" + account + " " + position.SymbolName + " " + result.Error);
-                }
+                list.Add(position);
             }
-            if (closedCount > 0)
-            {
-                _tradeSuccessCount++;
-                _lastAccountSyncCloseUtc[account] = DateTime.UtcNow;
-            }
+            ClosePositionListAsyncBurst(list, "[仓位同步-按账号]", true, account);
         }
 
         /// <summary>
