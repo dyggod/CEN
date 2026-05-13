@@ -54,6 +54,7 @@ cBot 提供以下可配置参数：
 - **RequestIntervalMs** (默认: 100)：上一轮「GET + 主线程处理 + POST ack」结束后再开始下一轮的最短间隔（毫秒）
 - **LeaseBatchLimit** (默认: 10)：单次 `GET /queue/lease` 最多取几条（上限 50，与 Node 一致）
 - **LeaseTtlMs** (默认: 120000)：服务端 lease 超时未 ack 时自动回队（毫秒）
+- **AsyncMarketOpen** (默认: true)：市价开仓用 `ExecuteMarketOrderAsync` 连续提交；设为 `false` 则恢复同步 `ExecuteMarketOrder`
 
 ## 📊 运行状态
 
@@ -69,7 +70,7 @@ cBot 运行后会在 cTrader 的 **日志** 窗口中显示信息：
 ```
 Queue Reader Bot 已启动
 服务器地址: http://127.0.0.1:6699/queue/lease
-轮询间隔: 100 ms（定时器 0.1 s）
+轮询间隔: 100 ms（定时器 Tick 100 ms）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [2025-12-05 00:30:01] 收到消息 #1
 操作类型: open
