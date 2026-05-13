@@ -1,12 +1,17 @@
+const crypto = require('crypto');
+
 /**
  * 消息队列管理类
  * 采用先进先出（FIFO）方式管理消息
  * 支持按 MT5 账户ID 分组存储
+ * 支持 lease/ack：批量租约出队，确认后删除；超时或 released 则回队
  */
 class MessageQueue {
     constructor() {
         this.queues = {}; // 按 MT5 账户ID 分组的队列对象 { mt5AccountId: [messages] }
         this.maxSize = 1000; // 每个队列的最大容量，防止内存溢出
+        /** @type {Map<string, { items: Array<{ mt5AccountId: string, message: Object }>, expiresAt: number, ctraderAccountId: string }>} */
+        this.leases = new Map();
         // 最近已接收事件（带时间戳），用于短窗口去重：{ mt5AccountId: Map<fingerprint, ts> }
         this.recentFingerprints = {};
         // 每个逻辑键最近一次事件时间，用于乱序保护：{ mt5AccountId: Map<orderKey, eventTimeMs> }
@@ -379,6 +384,135 @@ class MessageQueue {
             oldestMessageTime: allMessages.length > 0 ? allMessages[0].queueTime : null,
             newestMessageTime: allMessages.length > 0 ? allMessages[allMessages.length - 1].queueTime : null
         };
+    }
+
+    /**
+     * 将 lease 中的消息按原批次顺序插回各账户队列队首（逆序 unshift 以保持 FIFO）
+     * @param {Array<{ mt5AccountId: string, message: Object }>} items
+     */
+    _requeueLeaseItems(items) {
+        if (!Array.isArray(items) || items.length === 0) return;
+        for (let i = items.length - 1; i >= 0; i--) {
+            const row = items[i];
+            const id = String(row.mt5AccountId);
+            const msg = row.message;
+            if (!this.queues[id]) {
+                this.queues[id] = [];
+            }
+            this.queues[id].unshift(msg);
+        }
+    }
+
+    /**
+     * 处理已过期的 lease：回队并删除
+     */
+    expireLeases() {
+        const now = Date.now();
+        for (const [deliveryId, lease] of this.leases.entries()) {
+            if (lease.expiresAt <= now) {
+                this._requeueLeaseItems(lease.items);
+                this.leases.delete(deliveryId);
+                console.warn(`⏱️ lease 超时已自动回队: ${deliveryId} 共 ${lease.items.length} 条`);
+            }
+        }
+    }
+
+    /**
+     * 与 readFromAccounts 相同优先级，一次最多租约 limit 条（每条仍 shift 出主队列）
+     * @param {Array<string>} mt5AccountIds
+     * @param {number} limit
+     * @param {number} leaseTtlMs
+     * @param {string} ctraderAccountId
+     * @returns {{ deliveryId: string|null, items: Object[], leaseTtlMs: number }}
+     */
+    leaseBatchFromAccounts(mt5AccountIds, limit, leaseTtlMs, ctraderAccountId) {
+        try {
+            this.expireLeases();
+
+            if (!Array.isArray(mt5AccountIds) || mt5AccountIds.length === 0) {
+                return { deliveryId: null, items: [], leaseTtlMs: leaseTtlMs || 0 };
+            }
+            const cap = Math.min(50, Math.max(1, Math.floor(Number(limit)) || 10));
+            const ttl = Math.min(600000, Math.max(5000, Math.floor(Number(leaseTtlMs)) || 120000));
+
+            const picked = [];
+            let count = 0;
+            while (count < cap) {
+                let found = false;
+                for (const mt5AccountId of mt5AccountIds) {
+                    const key = String(mt5AccountId);
+                    const queue = this.queues[key];
+                    if (queue && queue.length > 0) {
+                        const message = queue.shift();
+                        picked.push({ mt5AccountId: key, message });
+                        count++;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+            }
+
+            if (picked.length === 0) {
+                return { deliveryId: null, items: [], leaseTtlMs: ttl };
+            }
+
+            const deliveryId = crypto.randomUUID();
+            const expiresAt = Date.now() + ttl;
+            this.leases.set(deliveryId, {
+                items: picked,
+                expiresAt,
+                ctraderAccountId: String(ctraderAccountId)
+            });
+
+            const items = picked.map((p) => p.message);
+            return { deliveryId, items, leaseTtlMs: ttl };
+        } catch (error) {
+            console.error('❌ leaseBatchFromAccounts 失败:', error.message);
+            return { deliveryId: null, items: [], leaseTtlMs: leaseTtlMs || 0 };
+        }
+    }
+
+    /**
+     * @param {string} deliveryId
+     * @param {string} ctraderAccountId
+     * @param {string} status committed = 确认消费；released = 主动放回队列
+     * @returns {{ ok: boolean, reason?: string }}
+     */
+    ackLease(deliveryId, ctraderAccountId, status) {
+        try {
+            this.expireLeases();
+
+            if (!deliveryId || typeof deliveryId !== 'string') {
+                return { ok: false, reason: 'missing_delivery_id' };
+            }
+            const lease = this.leases.get(deliveryId);
+            if (!lease) {
+                return { ok: false, reason: 'unknown_or_expired' };
+            }
+            if (String(lease.ctraderAccountId) !== String(ctraderAccountId)) {
+                return { ok: false, reason: 'account_mismatch' };
+            }
+
+            const st = String(status || '').toLowerCase();
+            this.leases.delete(deliveryId);
+
+            if (st === 'released') {
+                this._requeueLeaseItems(lease.items);
+                console.log(`↩️ lease 已释放回队: ${deliveryId} 共 ${lease.items.length} 条`);
+            } else if (st === 'committed') {
+                // 消息已在租约时移出主队列，committed 即永久丢弃 lease 记录
+                console.log(`✅ lease 已确认: ${deliveryId} 共 ${lease.items.length} 条`);
+            } else {
+                this._requeueLeaseItems(lease.items);
+                return { ok: false, reason: 'invalid_status_requeued' };
+            }
+
+            return { ok: true };
+        } catch (error) {
+            console.error('❌ ackLease 失败:', error.message);
+            return { ok: false, reason: 'ack_error', detail: error.message };
+        }
     }
 }
 

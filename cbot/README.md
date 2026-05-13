@@ -2,7 +2,7 @@
 
 ## 📋 功能说明
 
-这是一个 cTrader 的 cBot 程序，每秒钟自动请求一次本地服务器的 `/queue/read` 接口，读取消息队列中最早的消息并打印详细信息。
+这是一个 cTrader 的 cBot 程序，默认每 **100ms** 请求一次 `GET /queue/lease`（单次最多 **10** 条），在主线程执行交易后 `POST /queue/ack` 确认；仍可将 **ServerURL** 设为 `/queue/read` 使用旧版单条读即删。
 
 ## 🚀 安装步骤
 
@@ -42,18 +42,19 @@ C:\Users\你的用户名\Documents\cTrader\cBots\
 
 1. 在 **Automate** 模块中找到 `QueueReaderBot`
 2. 点击 **"启动"** 按钮
-3. cBot 将开始每秒请求一次队列接口
+3. cBot 将按「轮询间隔 + lease 周期」拉取队列（默认约每 100ms 一轮，含网络与执行时间）
 
 ## ⚙️ 参数说明
 
 cBot 提供以下可配置参数：
 
-- **ServerURL** (默认: `http://127.0.0.1:6699/queue/read`)
-  - 消息队列读取接口的完整URL
+- **ServerURL** (默认: `http://127.0.0.1:6699/queue/lease`)
+  - 使用 **lease 批量** 时指向 `/queue/lease`；若改为 `.../queue/read` 则走旧协议（无 ack）
   
-- **RequestInterval** (默认: 1 秒)
-  - 请求间隔时间（秒）
-  - 设置为 1 表示每秒请求一次
+- **RequestIntervalMs** (默认: 100)：上一轮「GET + 主线程处理 + POST ack」结束后再开始下一轮的最短间隔（毫秒）
+- **LeaseBatchLimit** (默认: 10)：单次 `GET /queue/lease` 最多取几条（上限 50，与 Node 一致）
+- **LeaseTtlMs** (默认: 120000)：服务端 lease 超时未 ack 时自动回队（毫秒）
+- **AsyncMarketOpen** (默认: true)：市价开仓用 `ExecuteMarketOrderAsync` 连续提交；设为 `false` 则恢复同步 `ExecuteMarketOrder`
 
 ## 📊 运行状态
 
@@ -68,8 +69,8 @@ cBot 运行后会在 cTrader 的 **日志** 窗口中显示信息：
 
 ```
 Queue Reader Bot 已启动
-服务器地址: http://127.0.0.1:6699/queue/read
-请求间隔: 1 秒
+服务器地址: http://127.0.0.1:6699/queue/lease
+轮询间隔: 100 ms（定时器 Tick 100 ms）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [2025-12-05 00:30:01] 收到消息 #1
 操作类型: open
