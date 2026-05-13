@@ -920,6 +920,8 @@ app.post('/position/report', async (req, res) => {
  */
 app.get('/queue/read', (req, res) => {
     try {
+        messageQueue.expireLeases();
+
         // 获取账户ID（从查询参数）
         const accountId = req.query.accountId || req.query.account_id;
         
@@ -1128,6 +1130,224 @@ app.get('/queue/read', (req, res) => {
 });
 
 /**
+ * 批量租约队列消息（P1：读出后暂存 lease，需 POST /queue/ack committed 才最终消费）
+ * GET /queue/lease?accountId=&limit=10&leaseTtlMs=120000
+ * 其余查询参数与 /queue/read 一致（仓位同步用）
+ */
+app.get('/queue/lease', (req, res) => {
+    try {
+        messageQueue.expireLeases();
+
+        const accountId = req.query.accountId || req.query.account_id;
+
+        if (!accountId) {
+            return res.status(400).json({
+                success: false,
+                error: '缺少账户ID参数',
+                message: '请求中必须包含 accountId 查询参数（例如：/queue/lease?accountId=12345678&limit=10）'
+            });
+        }
+
+        const accountIdStr = String(accountId);
+        if (CONFIG.ALLOWED_ACCOUNTS.CTRADER.length > 0 && !CONFIG.ALLOWED_ACCOUNTS.CTRADER.includes(accountIdStr)) {
+            return res.status(403).json({
+                success: false,
+                error: '账户ID不在允许范围内',
+                message: `账户ID ${accountIdStr} 不在允许的cTrader账户列表中`,
+                accountId: accountIdStr
+            });
+        }
+
+        let ctraderTotal = null;
+        let ctraderBuy = null;
+        let ctraderSell = null;
+
+        if (req.query.total !== undefined) {
+            ctraderTotal = parseInt(req.query.total);
+        } else if (req.query.totalPositions !== undefined) {
+            ctraderTotal = parseInt(req.query.totalPositions);
+        }
+
+        if (req.query.buy !== undefined) {
+            ctraderBuy = parseInt(req.query.buy);
+        } else if (req.query.buyPositions !== undefined) {
+            ctraderBuy = parseInt(req.query.buyPositions);
+        }
+
+        if (req.query.sell !== undefined) {
+            ctraderSell = parseInt(req.query.sell);
+        } else if (req.query.sellPositions !== undefined) {
+            ctraderSell = parseInt(req.query.sellPositions);
+        }
+
+        const ctraderAccountPositions = {};
+        const rawAccountPositions = req.query.accountPositions;
+        if (rawAccountPositions) {
+            const pairs = String(rawAccountPositions).split(',');
+            for (const pair of pairs) {
+                if (!pair) continue;
+                const idx = pair.indexOf(':');
+                if (idx <= 0) continue;
+                const account = pair.substring(0, idx).trim();
+                const count = parseInt(pair.substring(idx + 1).trim(), 10);
+                if (!account || Number.isNaN(count) || count <= 0) continue;
+                ctraderAccountPositions[account] = count;
+            }
+        }
+
+        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
+            const ctraderPos = {
+                total: ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : null),
+                buy: ctraderBuy !== null ? ctraderBuy : 0,
+                sell: ctraderSell !== null ? ctraderSell : 0
+            };
+
+            compareAndNotifyPositions(accountIdStr, ctraderPos).catch(err => {
+                console.error('❌ 比较仓位信息异常:', err.message);
+            });
+        }
+
+        const allowedMT5Accounts = CONFIG.ACCOUNT_MAPPING[accountIdStr];
+
+        if (!allowedMT5Accounts || !Array.isArray(allowedMT5Accounts) || allowedMT5Accounts.length === 0) {
+            return res.status(403).json({
+                success: false,
+                error: '账户对应关系未配置',
+                message: `cTrader账户 ${accountIdStr} 没有配置允许读取的MT5账户，请在 CONFIG.ACCOUNT_MAPPING 中配置`,
+                accountId: accountIdStr
+            });
+        }
+
+        let syncCloseSymbols = [];
+        let syncCloseInstructions = [];
+        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
+            const ctraderTotalVal = ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : 0);
+            if (ctraderTotalVal > 0) {
+                const defaultSymbols = [...(CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'])];
+                for (const id of allowedMT5Accounts) {
+                    const p = positionData.mt5[id];
+                    const mt5AccountId = String(id);
+                    const ctraderCountForAccount = ctraderAccountPositions[mt5AccountId] || 0;
+                    const hasFreshMt5Snapshot = isEaReportFreshForSyncClose(p);
+                    const mt5Total = p ? (p.total || 0) : 0;
+                    if (hasFreshMt5Snapshot && mt5Total === 0 && ctraderCountForAccount > 0) {
+                        syncCloseInstructions.push({
+                            mt5Account: mt5AccountId,
+                            symbols: [...defaultSymbols],
+                            reason: 'mt5_account_flat_but_ctrader_has_positions'
+                        });
+                    }
+                }
+            }
+            if (syncCloseInstructions.length > 0) {
+                const symbolSet = new Set();
+                for (const ins of syncCloseInstructions) {
+                    for (const sym of (ins.symbols || [])) {
+                        if (sym) symbolSet.add(String(sym));
+                    }
+                }
+                syncCloseSymbols = Array.from(symbolSet);
+            }
+        }
+
+        const limit = req.query.limit !== undefined ? parseInt(req.query.limit, 10) : 10;
+        const leaseTtlMs = req.query.leaseTtlMs !== undefined ? parseInt(req.query.leaseTtlMs, 10) : 120000;
+
+        const leased = messageQueue.leaseBatchFromAccounts(allowedMT5Accounts, limit, leaseTtlMs, accountIdStr);
+        const totalQueueSize = messageQueue.sizeFromAccounts(allowedMT5Accounts);
+
+        if (!leased.deliveryId || leased.items.length === 0) {
+            return res.json({
+                success: true,
+                message: '队列为空',
+                deliveryId: null,
+                items: [],
+                queueSize: totalQueueSize,
+                allowedMT5Accounts: allowedMT5Accounts,
+                syncCloseSymbols: syncCloseSymbols,
+                syncCloseInstructions: syncCloseInstructions,
+                leaseTtlMs: leased.leaseTtlMs
+            });
+        }
+
+        console.log(`\n📦 [lease] deliveryId=${leased.deliveryId} 条数=${leased.items.length} 剩余队列=${totalQueueSize} TTL=${leased.leaseTtlMs}ms\n`);
+
+        return res.json({
+            success: true,
+            message: 'lease 成功',
+            deliveryId: leased.deliveryId,
+            items: leased.items,
+            queueSize: totalQueueSize,
+            allowedMT5Accounts: allowedMT5Accounts,
+            syncCloseSymbols: syncCloseSymbols,
+            syncCloseInstructions: syncCloseInstructions,
+            leaseTtlMs: leased.leaseTtlMs
+        });
+    } catch (error) {
+        console.error('❌ lease 队列失败:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * 确认或释放 lease（P1）
+ * POST JSON: { "accountId": "...", "deliveryId": "...", "status": "committed" | "released" }
+ */
+app.post('/queue/ack', (req, res) => {
+    try {
+        messageQueue.expireLeases();
+
+        const accountId = req.body?.accountId || req.query.accountId || req.query.account_id;
+        const deliveryId = req.body?.deliveryId;
+        const status = req.body?.status;
+
+        if (!accountId) {
+            return res.status(400).json({
+                success: false,
+                error: '缺少 accountId'
+            });
+        }
+
+        const accountIdStr = String(accountId);
+        if (CONFIG.ALLOWED_ACCOUNTS.CTRADER.length > 0 && !CONFIG.ALLOWED_ACCOUNTS.CTRADER.includes(accountIdStr)) {
+            return res.status(403).json({
+                success: false,
+                error: '账户ID不在允许范围内',
+                accountId: accountIdStr
+            });
+        }
+
+        const result = messageQueue.ackLease(deliveryId, accountIdStr, status);
+        if (!result.ok) {
+            return res.status(400).json({
+                success: false,
+                error: result.reason || 'ack_failed',
+                detail: result.detail,
+                accountId: accountIdStr
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: 'ack 成功',
+            accountId: accountIdStr,
+            deliveryId: deliveryId,
+            status: status,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('❌ ack 失败:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
  * 查看队列统计信息（不删除消息）
  * 支持查询参数 accountId 来查看特定 MT5 账户的统计
  */
@@ -1202,7 +1422,9 @@ app.listen(CONFIG.PORT, () => {
     console.log(`  POST /notify         - 仅发送邮件通知`);
     console.log(`  POST /trade          - 接收EA交易信息（开仓/平仓）[需要 accountId]`);
     console.log(`  POST /position/report - 接收EA上报仓位信息（总/多/空）[需要 accountId]`);
-    console.log(`  GET  /queue/read     - 读取队列中最早的消息（FIFO，读取后删除）[需要 accountId，可选仓位参数]`);
+    console.log(`  GET  /queue/read     - 读取单条（FIFO，读即删，兼容旧版 cBot）`);
+    console.log(`  GET  /queue/lease    - 批量租约（默认 limit=10，需 POST /queue/ack）`);
+    console.log(`  POST /queue/ack      - 确认 committed 或释放 released`);
     console.log(`  GET  /queue/stats    - 查看队列统计信息`);
     console.log('='.repeat(60));
     console.log('\n⚠️  重要提示:');

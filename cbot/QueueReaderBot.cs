@@ -1,5 +1,6 @@
 using System;
 using System.Net.Http;
+using System.Text;
 using System.Threading.Tasks;
 using cAlgo.API;
 
@@ -8,12 +9,18 @@ namespace cAlgo.Robots
     [Robot(TimeZone = TimeZones.UTC)]
     public class QueueReaderBot : Robot
     {
-        // 输入参数
-        [Parameter("服务器地址", DefaultValue = "http://127.0.0.1:6699/queue/read")]
+        // 输入参数（P0/P1：默认走 /queue/lease + /queue/ack）
+        [Parameter("服务器地址", DefaultValue = "http://127.0.0.1:6699/queue/lease")]
         public string ServerURL { get; set; }
 
-        [Parameter("请求间隔（秒）", DefaultValue = 1, MinValue = 1)]
-        public int RequestInterval { get; set; }
+        [Parameter("轮询间隔（毫秒）", DefaultValue = 100, MinValue = 50)]
+        public int RequestIntervalMs { get; set; }
+
+        [Parameter("单次租约最大条数", DefaultValue = 10, MinValue = 1, MaxValue = 50)]
+        public int LeaseBatchLimit { get; set; }
+
+        [Parameter("Lease 超时毫秒（服务端未收到 ack 则回队）", DefaultValue = 120000, MinValue = 5000)]
+        public int LeaseTtlMs { get; set; }
 
         [Parameter("消息过期时间（秒）", DefaultValue = 10, MinValue = 1)]
         public int MessageExpireSeconds { get; set; }
@@ -33,7 +40,8 @@ namespace cAlgo.Robots
         private int _expiredCount = 0;  // 过期消息计数
         private int _tradeSuccessCount = 0;  // 交易成功计数
         private int _tradeFailCount = 0;  // 交易失败计数
-        private DateTime _lastRequestTime = DateTime.MinValue;
+        private DateTime _lastLeaseCycleEndUtc = DateTime.MinValue;
+        private volatile bool _leaseCycleBusy;
         /// <summary>各 MT5 账号最近一次仓位同步成功平掉至少一单的时间（UTC），用于解释紧随其后的队列 close/modify 找不到持仓</summary>
         private readonly System.Collections.Generic.Dictionary<string, DateTime> _lastAccountSyncCloseUtc =
             new System.Collections.Generic.Dictionary<string, DateTime>(System.StringComparer.Ordinal);
@@ -47,13 +55,15 @@ namespace cAlgo.Robots
             _httpClient = new HttpClient();
             _httpClient.Timeout = TimeSpan.FromSeconds(5);
 
-            // 启动定时器，每秒触发一次 OnTimer
-            Timer.Start(1);
+            double timerSec = Math.Max(0.05, RequestIntervalMs / 1000.0);
+            Timer.Start(timerSec);
 
             Print("Queue Reader Bot 已启动");
             Print("服务器地址: " + ServerURL);
             Print("当前账户ID: " + _accountId);
-            Print("请求间隔: " + RequestInterval + " 秒");
+            Print("轮询间隔: " + RequestIntervalMs + " ms（定时器 " + timerSec + " s）");
+            Print("单次租约条数上限: " + LeaseBatchLimit);
+            Print("Lease TTL(ms): " + LeaseTtlMs);
             Print("消息过期时间: " + MessageExpireSeconds + " 秒");
             if (FixedVolume > 0)
                 Print("固定手数: " + FixedVolume + " 手（将忽略消息中的手数）");
@@ -63,124 +73,227 @@ namespace cAlgo.Robots
 
         protected override void OnTimer()
         {
-            // 检查是否到了请求时间（根据 RequestInterval 参数控制）
-            if ((DateTime.Now - _lastRequestTime).TotalSeconds >= RequestInterval)
-            {
-                _lastRequestTime = DateTime.Now;
-                
-                // 在主线程中获取仓位信息（Positions 只能在主线程访问）
-                // 只统计指定标的的仓位
-                string[] checkSymbolsArray = CheckSymbols.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-                int totalPositions = 0;
-                int buyPositions = 0;
-                int sellPositions = 0;
-                var accountPositionCounts = new System.Collections.Generic.Dictionary<string, int>(System.StringComparer.Ordinal);
-                
-                foreach (var position in Positions)
-                {
-                    // 检查是否在要检查的标的列表中
-                    bool shouldCheck = false;
-                    if (checkSymbolsArray.Length == 0)
-                    {
-                        // 如果没有配置标的，默认检查所有（兼容旧版本）
-                        shouldCheck = true;
-                    }
-                    else
-                    {
-                        foreach (string symbol in checkSymbolsArray)
-                        {
-                            if (position.SymbolName.Trim() == symbol.Trim())
-                            {
-                                shouldCheck = true;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (shouldCheck)
-                    {
-                        totalPositions++;
-                        if (position.TradeType == TradeType.Buy)
-                            buyPositions++;
-                        else if (position.TradeType == TradeType.Sell)
-                            sellPositions++;
+            if (_leaseCycleBusy)
+                return;
 
-                        // 按标签统计各 MT5 账号在 cTrader 的仓位数量，用于服务端账号级同步判断
-                        string labelAccount;
-                        if (!string.IsNullOrEmpty(position.Label) && TryExtractMt5AccountFromLabel(position.Label, out labelAccount))
+            double msSinceLast = (DateTime.UtcNow - _lastLeaseCycleEndUtc).TotalMilliseconds;
+            if (_lastLeaseCycleEndUtc != DateTime.MinValue && msSinceLast < RequestIntervalMs)
+                return;
+
+            string[] checkSymbolsArray = CheckSymbols.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            int totalPositions = 0;
+            int buyPositions = 0;
+            int sellPositions = 0;
+            var accountPositionCounts = new System.Collections.Generic.Dictionary<string, int>(System.StringComparer.Ordinal);
+
+            foreach (var position in Positions)
+            {
+                bool shouldCheck = false;
+                if (checkSymbolsArray.Length == 0)
+                {
+                    shouldCheck = true;
+                }
+                else
+                {
+                    foreach (string symbol in checkSymbolsArray)
+                    {
+                        if (position.SymbolName.Trim() == symbol.Trim())
                         {
-                            int oldCount = 0;
-                            accountPositionCounts.TryGetValue(labelAccount, out oldCount);
-                            accountPositionCounts[labelAccount] = oldCount + 1;
+                            shouldCheck = true;
+                            break;
                         }
                     }
                 }
-                
-                string accountPositionsParam = BuildAccountPositionsParam(accountPositionCounts);
 
-                // 使用 Task.Run 在后台执行异步操作，传递仓位信息
-                Task.Run(async () => await RequestQueueMessage(totalPositions, buyPositions, sellPositions, accountPositionsParam));
+                if (shouldCheck)
+                {
+                    totalPositions++;
+                    if (position.TradeType == TradeType.Buy)
+                        buyPositions++;
+                    else if (position.TradeType == TradeType.Sell)
+                        sellPositions++;
+
+                    string labelAccount;
+                    if (!string.IsNullOrEmpty(position.Label) && TryExtractMt5AccountFromLabel(position.Label, out labelAccount))
+                    {
+                        int oldCount = 0;
+                        accountPositionCounts.TryGetValue(labelAccount, out oldCount);
+                        accountPositionCounts[labelAccount] = oldCount + 1;
+                    }
+                }
             }
+
+            string accountPositionsParam = BuildAccountPositionsParam(accountPositionCounts);
+
+            _leaseCycleBusy = true;
+            Task.Run(async () => await RunLeaseHttpCycleAsync(totalPositions, buyPositions, sellPositions, accountPositionsParam));
         }
 
-        private async Task RequestQueueMessage(int totalPositions, int buyPositions, int sellPositions, string accountPositionsParam)
+        /// <summary>
+        /// P0：串行完整周期（GET lease → 主线程处理 → POST ack）；P1：ack 后 lease 才最终消费。
+        /// </summary>
+        private async Task RunLeaseHttpCycleAsync(int totalPositions, int buyPositions, int sellPositions, string accountPositionsParam)
         {
             _requestCount++;
 
             try
             {
-                // 构建带账户ID和仓位信息的URL（使用预先获取的账户ID，避免在后台线程访问 Account.Number）
                 string urlWithAccountId = ServerURL;
                 if (ServerURL.Contains("?"))
-                {
                     urlWithAccountId += "&accountId=" + _accountId;
-                }
                 else
-                {
                     urlWithAccountId += "?accountId=" + _accountId;
-                }
-                
-                // 添加仓位信息到URL查询参数
+
                 urlWithAccountId += "&total=" + totalPositions;
                 urlWithAccountId += "&buy=" + buyPositions;
                 urlWithAccountId += "&sell=" + sellPositions;
                 if (!string.IsNullOrEmpty(accountPositionsParam))
                     urlWithAccountId += "&accountPositions=" + Uri.EscapeDataString(accountPositionsParam);
-                
-                // 发送GET请求
+
+                if (ServerURL.Contains("/queue/lease"))
+                {
+                    urlWithAccountId += "&limit=" + LeaseBatchLimit;
+                    urlWithAccountId += "&leaseTtlMs=" + LeaseTtlMs;
+                }
+
                 HttpResponseMessage response = await _httpClient.GetAsync(urlWithAccountId);
                 response.EnsureSuccessStatusCode();
-                
-                // 读取响应内容
+
                 string responseBody = await response.Content.ReadAsStringAsync();
-                
                 _successCount++;
-                
-                // 在主线程中处理消息（Print 和交易操作必须在主线程）
-                BeginInvokeOnMainThread(() => {
-                    ProcessMessage(responseBody);
+
+                var tcs = new TaskCompletionSource<string>();
+                BeginInvokeOnMainThread(() =>
+                {
+                    try
+                    {
+                        string deliveryId = ProcessQueueResponseOnMainThread(responseBody);
+                        tcs.TrySetResult(deliveryId ?? "");
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.TrySetException(ex);
+                    }
                 });
-                
+
+                string ackId = await tcs.Task.ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(ackId))
+                    await PostAckCommittedAsync(ackId).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 _failCount++;
-                // 错误信息也要在主线程中打印
-                BeginInvokeOnMainThread(() => {
+                BeginInvokeOnMainThread(() =>
+                {
                     Print("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] 请求失败 #" + _requestCount);
                     Print("错误: " + ex.Message);
                 });
             }
+            finally
+            {
+                _leaseCycleBusy = false;
+                _lastLeaseCycleEndUtc = DateTime.UtcNow;
+            }
         }
 
-        /// <summary>
-        /// 解析并处理消息
-        /// </summary>
-        private void ProcessMessage(string jsonResponse)
+        private async Task PostAckCommittedAsync(string deliveryId)
         {
             try
             {
-                // 优先处理仓位同步（新协议）：按 MT5 账号 + 标的平仓
+                string ackUrl = BuildAckPostUrl();
+                string json = "{\"accountId\":" + _accountId.ToString() + ",\"deliveryId\":\"" + deliveryId + "\",\"status\":\"committed\"}";
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                HttpResponseMessage resp = await _httpClient.PostAsync(ackUrl, content).ConfigureAwait(false);
+                resp.EnsureSuccessStatusCode();
+            }
+            catch (Exception ex)
+            {
+                BeginInvokeOnMainThread(() =>
+                {
+                    Print("⚠️  POST /queue/ack 失败（lease 将超时回队）: " + ex.Message);
+                });
+            }
+        }
+
+        private string BuildAckPostUrl()
+        {
+            string u = ServerURL.Trim();
+            if (u.Contains("/queue/lease"))
+                return u.Replace("/queue/lease", "/queue/ack");
+            if (u.Contains("/queue/read"))
+                return u.Replace("/queue/read", "/queue/ack");
+            int q = u.IndexOf("?");
+            string baseNoQuery = q >= 0 ? u.Substring(0, q) : u;
+            baseNoQuery = baseNoQuery.TrimEnd('/');
+            if (baseNoQuery.EndsWith("/queue/ack", StringComparison.OrdinalIgnoreCase))
+                return u;
+            return baseNoQuery + "/queue/ack";
+        }
+
+        /// <summary>
+        /// 从 JSON 中解析 "items":[ {...}, ... ] 里每个对象的子串（无外部 JSON 库）。
+        /// </summary>
+        private static System.Collections.Generic.List<string> ExtractJsonObjectsFromArrayProperty(string json, string arrayPropertyName)
+        {
+            var result = new System.Collections.Generic.List<string>();
+            string key = "\"" + arrayPropertyName + "\":[";
+            int start = json.IndexOf(key);
+            if (start < 0)
+                return result;
+
+            int i = start + key.Length;
+            while (i < json.Length && char.IsWhiteSpace(json[i]))
+                i++;
+            if (i < json.Length && json[i] == ']')
+                return result;
+
+            while (i < json.Length)
+            {
+                while (i < json.Length && char.IsWhiteSpace(json[i]))
+                    i++;
+                if (i >= json.Length || json[i] == ']')
+                    break;
+                if (json[i] == ',')
+                {
+                    i++;
+                    continue;
+                }
+                if (json[i] != '{')
+                    break;
+
+                int depth = 0;
+                int objStart = i;
+                bool closed = false;
+                for (int j = i; j < json.Length; j++)
+                {
+                    char c = json[j];
+                    if (c == '{')
+                        depth++;
+                    else if (c == '}')
+                    {
+                        depth--;
+                        if (depth == 0)
+                        {
+                            result.Add(json.Substring(objStart, j - objStart + 1));
+                            i = j + 1;
+                            closed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!closed)
+                    break;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// 主线程：仓位同步 + 单条 read 或 批量 lease；返回需 ack 的 deliveryId（无则空串）。
+        /// </summary>
+        private string ProcessQueueResponseOnMainThread(string jsonResponse)
+        {
+            try
+            {
                 var syncCloseInstructions = ParseSyncCloseInstructions(jsonResponse);
                 if (syncCloseInstructions != null && syncCloseInstructions.Count > 0)
                 {
@@ -199,7 +312,6 @@ namespace cAlgo.Robots
                 }
                 else
                 {
-                    // 兼容旧协议：仅返回 syncCloseSymbols（无法按账号过滤）
                     var syncCloseSymbols = ParseSyncCloseSymbols(jsonResponse);
                     if (syncCloseSymbols != null && syncCloseSymbols.Count > 0)
                     {
@@ -212,19 +324,68 @@ namespace cAlgo.Robots
                     }
                 }
 
-                // 检查是否包含"data":null（队列为空）
-                if (jsonResponse.Contains("\"data\":null") || jsonResponse.Contains("\"data\": null"))
+                // ---------- P1：/queue/lease 批量 ----------
+                if (jsonResponse.IndexOf("\"items\":[", StringComparison.Ordinal) >= 0)
                 {
-                    // 队列为空，不打印日志，直接返回
-                    return;
+                    var itemJsons = ExtractJsonObjectsFromArrayProperty(jsonResponse, "items");
+                    string deliveryId = "";
+                    if (jsonResponse.IndexOf("\"deliveryId\":null", StringComparison.Ordinal) >= 0)
+                        deliveryId = "";
+                    else
+                        deliveryId = ExtractStringValue(jsonResponse, "deliveryId");
+
+                    if (itemJsons.Count == 0)
+                        return deliveryId;
+
+                    Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    Print("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] 收到批量 lease 共 " + itemJsons.Count + " 条 #" + _requestCount);
+                    if (!string.IsNullOrEmpty(deliveryId))
+                        Print("deliveryId: " + deliveryId);
+
+                    for (int idx = 0; idx < itemJsons.Count; idx++)
+                    {
+                        string one = itemJsons[idx];
+                        var messageData = ParseMessageData(one);
+                        if (messageData == null)
+                            continue;
+
+                        Print("--- 第 " + (idx + 1) + "/" + itemJsons.Count + " 条 ---");
+                        Print("操作类型: " + messageData.Action + " | 品种: " + messageData.Symbol);
+
+                        if (IsMessageExpired(messageData.Action, messageData.EventTimeMs, messageData.Utc8Time))
+                        {
+                            _expiredCount++;
+                            Print("⚠️  消息已过期，跳过（超过 " + MessageExpireSeconds + " 秒）");
+                            continue;
+                        }
+
+                        ExecuteTrade(messageData);
+                    }
+
+                    int queueSizeIndex = jsonResponse.IndexOf("\"queueSize\":");
+                    if (queueSizeIndex >= 0)
+                    {
+                        int qsStart = queueSizeIndex + 12;
+                        int qsEnd = jsonResponse.IndexOf(",", qsStart);
+                        if (qsEnd < 0) qsEnd = jsonResponse.IndexOf("}", qsStart);
+                        if (qsEnd > qsStart)
+                        {
+                            string queueSizeStr = jsonResponse.Substring(qsStart, qsEnd - qsStart).Trim();
+                            Print("队列剩余: " + queueSizeStr + " 条消息");
+                        }
+                    }
+                    Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+                    return string.IsNullOrEmpty(deliveryId) ? "" : deliveryId;
                 }
 
-                // 检查是否有消息数据
+                // ---------- 兼容旧 GET /queue/read 单条 ----------
+                if (jsonResponse.Contains("\"data\":null") || jsonResponse.Contains("\"data\": null"))
+                    return "";
+
                 if (jsonResponse.Contains("\"data\":{"))
                 {
-                    // 解析消息数据
                     var messageData = ParseMessageData(jsonResponse);
-                    
                     if (messageData != null)
                     {
                         Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -244,22 +405,18 @@ namespace cAlgo.Robots
                             Print("时间 (UTC+8): " + messageData.Utc8Time);
                         if (messageData.EventTimeMs.HasValue)
                             Print("消息时间戳(ms): " + messageData.EventTimeMs.Value);
-                        
-                        // 检查消息是否过期
+
                         if (IsMessageExpired(messageData.Action, messageData.EventTimeMs, messageData.Utc8Time))
                         {
                             _expiredCount++;
                             Print("⚠️  消息已过期，丢弃（超过 " + MessageExpireSeconds + " 秒）");
                             Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                            return;
+                            return "";
                         }
-                        
+
                         Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                        
-                        // 执行交易操作
                         ExecuteTrade(messageData);
-                        
-                        // 提取队列大小
+
                         int queueSizeIndex = jsonResponse.IndexOf("\"queueSize\":");
                         if (queueSizeIndex >= 0)
                         {
@@ -273,19 +430,27 @@ namespace cAlgo.Robots
                             }
                         }
                     }
+                    return "";
                 }
-                else
-                {
-                    // 无法解析，打印原始响应
-                    Print("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] 请求成功 #" + _requestCount);
-                    Print("响应内容: " + jsonResponse);
-                }
+
+                Print("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] 请求成功 #" + _requestCount);
+                Print("响应内容: " + jsonResponse);
+                return "";
             }
             catch (Exception ex)
             {
                 Print("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] 解析响应失败: " + ex.Message);
                 Print("原始响应: " + jsonResponse);
+                return "";
             }
+        }
+
+        /// <summary>
+        /// 解析并处理消息
+        /// </summary>
+        private void ProcessMessage(string jsonResponse)
+        {
+            ProcessQueueResponseOnMainThread(jsonResponse);
         }
 
         /// <summary>

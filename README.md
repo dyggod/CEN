@@ -11,10 +11,10 @@
 │ HealthCheckEA    │────▶│                    │◀────│ QueueReaderBot   │
 │ (MQL5)           │     │  ┌─ FIFO 消息队列 ─┐│     │ (C#)             │
 │                  │     │  │ 按 MT5 账号分组  ││     │                  │
-│ PositionChange   │     │  │ 去重/乱序保护    ││     │  每秒轮询队列     │
-│ EmailEA (MQL5)   │     │  └────────────────┘│     │  执行交易操作     │
+│ PositionChange   │     │  │ 去重/乱序保护    ││     │  默认100ms轮询   │
+│ EmailEA (MQL5)   │     │  └────────────────┘│     │  lease+ack       │
 │                  │     │                    │     │                  │
-│ POST /trade      │     │  仓位对比告警       │     │  GET /queue/read │
+│ POST /trade      │     │  仓位对比告警       │     │  GET /queue/lease │
 │ POST /position/  │     │  截图 (cTrader窗口) │     │                  │
 │   report         │     │  邮件通知           │     │                  │
 │ POST /health     │     │                    │     │                  │
@@ -24,7 +24,7 @@
 **数据流：**
 1. MT5 EA 检测到交易事件 → `POST /trade` 推送到 Node 服务器
 2. 服务器按 MT5 账户 ID 存入内存 FIFO 队列（去重 + 乱序保护）
-3. cTrader cBot 每秒轮询 `GET /queue/read`，获取并执行消息（开仓/平仓/修改/挂单）
+3. cTrader cBot 默认每 100ms 调用 `GET /queue/lease` 一次最多租约 10 条，主线程执行后 `POST /queue/ack` 确认；仍支持旧版 `GET /queue/read` 单条读即删
 4. 服务器持续对比 MT5 vs cTrader 仓位，不匹配时发邮件告警并触发同步强平
 
 ---
