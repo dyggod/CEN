@@ -18,12 +18,14 @@ const CONFIG = {
     
     // 邮件配置
     EMAIL: {
-        FROM: '648093171@qq.com',
+        FROM: 'dyggod2@163.com',
         TO: 'dyggod@163.com',
-        SMTP_HOST: 'smtp.qq.com',
+        SMTP_HOST: 'smtp.163.com',
         SMTP_PORT: 465,
-        // 重要：这里填写您的QQ邮箱授权码
-        SMTP_PASSWORD: 'lmefrkcflwgrbecb'
+        // 重要：这里填写您的邮箱授权码
+        SMTP_PASSWORD: 'KNrmcK9ekrH2zF9u',
+        // 服务启动时发送一封测试邮件并记录结果
+        STARTUP_TEST: true
     },
     
     // 截图保存路径
@@ -116,6 +118,9 @@ try {
         host: CONFIG.EMAIL.SMTP_HOST,
         port: CONFIG.EMAIL.SMTP_PORT,
         secure: true,
+        connectionTimeout: 15000,
+        greetingTimeout: 15000,
+        socketTimeout: 20000,
         auth: {
             user: CONFIG.EMAIL.FROM,
             pass: CONFIG.EMAIL.SMTP_PASSWORD
@@ -123,7 +128,7 @@ try {
     });
     console.log('📧 邮件服务配置完成');
 } catch (error) {
-    console.error('❌ 邮件服务配置失败:', error.message);
+    serverLog('error', '❌ 邮件服务配置失败:', error.message);
 }
 
 // ==================== 仓位信息存储 ====================
@@ -433,7 +438,8 @@ ${lastSentTime > 0 ? `\n📌 注：上次通知时间: ${new Date(lastSentTime).
                     lastEmailSentTime[accountPairKey] = now;
                     console.log(`⚠️  仓位不匹配，已发送邮件通知: cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`);
                 } catch (emailError) {
-                    console.error('❌ 发送仓位不匹配邮件失败:', emailError.message);
+                    serverLog('error', '❌ 发送仓位不匹配邮件失败:', emailError.message);
+                    logEmailErrorDetail('仓位不匹配邮件', emailError);
                 }
             } else {
                 // 不发送邮件，但记录日志（降低频率）
@@ -450,6 +456,61 @@ ${lastSentTime > 0 ? `\n📌 注：上次通知时间: ${new Date(lastSentTime).
         }
     } catch (error) {
         console.error('❌ 比较仓位信息失败:', error.message);
+    }
+}
+
+/**
+ * 统一日志：PM2 将 stderr→error.log、stdout→output.log。
+ * 错误同时写入 stdout，避免只在 output.log 里看到「准备发送」却看不到失败原因。
+ */
+function serverLog(level, ...args) {
+    if (level === 'error') {
+        console.error(...args);
+        console.log(...args);
+    } else {
+        console.log(...args);
+    }
+}
+
+/**
+ * 打印邮件相关错误的详细信息（SMTP / nodemailer）
+ */
+function logEmailErrorDetail(context, error) {
+    const err = error || new Error('未知错误');
+    serverLog('error', `❌ [${context}] 邮件发送失败`);
+    serverLog('error', `  消息: ${err.message || String(err)}`);
+
+    const fields = [
+        ['错误码 (code)', err.code],
+        ['SMTP 响应码 (responseCode)', err.responseCode],
+        ['SMTP 响应 (response)', err.response],
+        ['SMTP 命令 (command)', err.command],
+        ['系统 errno', err.errno],
+        ['系统调用 (syscall)', err.syscall],
+        ['主机 (hostname)', err.hostname],
+        ['端口 (port)', err.port]
+    ];
+    for (const [label, value] of fields) {
+        if (value != null && value !== '') {
+            serverLog('error', `  ${label}: ${value}`);
+        }
+    }
+
+    if (Array.isArray(err.rejected) && err.rejected.length > 0) {
+        serverLog('error', `  被拒收件人: ${err.rejected.join(', ')}`);
+    }
+    if (Array.isArray(err.rejectedErrors) && err.rejectedErrors.length > 0) {
+        err.rejectedErrors.forEach((rejectedErr, index) => {
+            const msg = rejectedErr?.message || String(rejectedErr);
+            serverLog('error', `  被拒详情[${index}]: ${msg}`);
+        });
+    }
+
+    if (err.stack) {
+        serverLog('error', '  堆栈:');
+        for (const line of err.stack.split('\n')) {
+            serverLog('error', `    ${line}`);
+        }
     }
 }
 
@@ -491,8 +552,77 @@ async function sendEmail(subject, body, screenshotBuffer, filename) {
         return info;
         
     } catch (error) {
-        console.error('❌ 邮件发送失败:', error.message);
+        logEmailErrorDetail('邮件发送', error);
         throw error;
+    }
+}
+
+/**
+ * 服务启动时发送测试邮件，记录成功/失败结果
+ */
+async function testEmailOnStartup() {
+    const startedAt = new Date().toISOString();
+    const localTime = new Date().toLocaleString('zh-CN');
+
+    console.log('\n' + '-'.repeat(60));
+    console.log('📧 启动邮件自检');
+    console.log(`  时间: ${localTime} (${startedAt})`);
+    console.log(`  SMTP: ${CONFIG.EMAIL.SMTP_HOST}:${CONFIG.EMAIL.SMTP_PORT}`);
+    console.log(`  发件: ${CONFIG.EMAIL.FROM}`);
+    console.log(`  收件: ${CONFIG.EMAIL.TO}`);
+    console.log('-'.repeat(60));
+
+    if (!CONFIG.EMAIL.STARTUP_TEST) {
+        console.log('⏭️  启动邮件自检已关闭 (CONFIG.EMAIL.STARTUP_TEST = false)');
+        console.log('-'.repeat(60) + '\n');
+        return { ok: null, skipped: true, reason: 'disabled' };
+    }
+
+    if (!transporter) {
+        const reason = '邮件 transporter 未初始化';
+        serverLog('error', `❌ [启动邮件自检] 跳过: ${reason}`);
+        console.log(`📧 启动邮件自检结果: 跳过 (${reason})`);
+        console.log('-'.repeat(60) + '\n');
+        return { ok: false, skipped: true, reason };
+    }
+
+    if (CONFIG.EMAIL.SMTP_PASSWORD === 'your-qq-auth-code-here') {
+        const reason = '未配置 QQ 邮箱授权码 (SMTP_PASSWORD 仍为占位符)';
+        serverLog('error', `❌ [启动邮件自检] 跳过: ${reason}`);
+        console.log(`📧 启动邮件自检结果: 跳过 (${reason})`);
+        console.log('-'.repeat(60) + '\n');
+        return { ok: false, skipped: true, reason };
+    }
+
+    const subject = `[启动测试] Keltner Webhook - ${localTime}`;
+    const body = [
+        '这是一封 Node 服务启动时的自动测试邮件。',
+        '',
+        `服务器时间: ${localTime}`,
+        `ISO 时间: ${startedAt}`,
+        `监听端口: ${CONFIG.PORT}`,
+        `进程 PID: ${process.pid}`,
+        `Node 版本: ${process.version}`
+    ].join('\n');
+
+    try {
+        console.log('📧 正在发送启动测试邮件...');
+        const info = await sendEmail(subject, body, null, null);
+        console.log('✅ [启动邮件自检] 通过');
+        console.log(`  messageId: ${info.messageId || '(无)'}`);
+        console.log(`  accepted: ${(info.accepted && info.accepted.length) ? info.accepted.join(', ') : '(无)'}`);
+        console.log(`  rejected: ${(info.rejected && info.rejected.length) ? info.rejected.join(', ') : '(无)'}`);
+        console.log(`  response: ${info.response || '(无)'}`);
+        console.log(`📧 启动邮件自检结果: 通过 (messageId=${info.messageId || '无'})`);
+        console.log('-'.repeat(60) + '\n');
+        return { ok: true, messageId: info.messageId, accepted: info.accepted, rejected: info.rejected };
+    } catch (error) {
+        serverLog('error', '❌ [启动邮件自检] 未通过 — SMTP 实际发信失败，详情见上方');
+        const codePart = error.code ? ` code=${error.code}` : '';
+        const smtpPart = error.responseCode ? ` smtp=${error.responseCode}` : '';
+        console.log(`📧 启动邮件自检结果: 失败${codePart}${smtpPart} — ${error.message}`);
+        console.log('-'.repeat(60) + '\n');
+        return { ok: false, reason: error.message, code: error.code, responseCode: error.responseCode };
     }
 }
 
@@ -1381,7 +1511,7 @@ app.use((err, req, res, next) => {
 
 // ==================== 启动服务器 ====================
 
-app.listen(CONFIG.PORT, () => {
+app.listen(CONFIG.PORT, async () => {
     console.clear();
     console.log('\n' + '='.repeat(60));
     console.log('🚀 Keltner Webhook 服务器启动成功!');
@@ -1433,6 +1563,9 @@ app.listen(CONFIG.PORT, () => {
     console.log('3. 在 server.js 的 CONFIG.ALLOWED_ACCOUNTS 中配置允许的账户ID');
     console.log('4. 按 Ctrl+C 停止服务器');
     console.log('='.repeat(60) + '\n');
+
+    await testEmailOnStartup();
+
     console.log('等待信号中...\n');
     console.log('📜 日志: npm run logs:rotate 手动归档至 logs/history；已启用跨自然日自动滚动（每 10 分钟检查）\n');
     startAutoLogRotation(10 * 60 * 1000);
