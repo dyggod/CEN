@@ -18,12 +18,12 @@ const CONFIG = {
     
     // 邮件配置
     EMAIL: {
-        FROM: 'dyggod2@163.com',
-        TO: 'dyggod@163.com',
+        FROM: 'dyggod@163.com',
+        TO: 'dyggod2@163.com',
         SMTP_HOST: 'smtp.163.com',
         SMTP_PORT: 465,
         // 重要：这里填写您的邮箱授权码
-        SMTP_PASSWORD: 'KNrmcK9ekrH2zF9u',
+        SMTP_PASSWORD: 'AYpvxL6SXmQ4iKty',
         // 服务启动时发送一封测试邮件并记录结果
         STARTUP_TEST: true
     },
@@ -140,12 +140,19 @@ const positionData = {
     ctrader: {}
 };
 
-// ==================== 邮件发送频率控制 ====================
-// 记录每个账户对的上次发送邮件时间
-// 格式: { "ctraderAccountId_mt5AccountId": timestamp }
-const lastEmailSentTime = {};
-// 最小发送间隔（毫秒）：仓位不匹配邮件节流
-const EMAIL_NOTIFY_INTERVAL = 30 * 1000;
+// ==================== 仓位不匹配通知状态控制 ====================
+// 仅在“匹配 -> 不匹配”边沿发送一次邮件，避免持续不匹配时刷屏/刷邮件
+// 格式:
+// {
+//   "ctraderAccountId_mt5AccountsKey": {
+//      notified: boolean,             // 当前不匹配周期是否已通知
+//      mismatchSince: timestamp,      // 首次进入不匹配的时间
+//      lastSuppressedLogAt: timestamp // 持续不匹配时上次打印抑制日志的时间
+//   }
+// }
+const mismatchNotifyState = {};
+// 持续不匹配时，抑制日志打印间隔（毫秒）
+const MISMATCH_SUPPRESSED_LOG_INTERVAL = 30 * 1000;
 
 // ==================== 工具函数 ====================
 
@@ -359,21 +366,27 @@ async function compareAndNotifyPositions(ctraderAccountId, ctraderPos) {
         const checkSymbols = CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'];
         const checkSymbolsText = checkSymbols.join(', ');
         
+        // 生成账户对的唯一标识（使用所有 MT5 账户ID的组合）
+        const mt5AccountsKey = allowedMT5Accounts.join('_');
+        const accountPairKey = `${ctraderAccountId}_${mt5AccountsKey}`;
+        const now = Date.now();
+        const isMismatch = (ctraderTotal !== mt5TotalSum || ctraderBuy !== mt5BuySum || ctraderSell !== mt5SellSum);
+
+
         // 检查是否不匹配（只检查指定标的的仓位）
-        if (ctraderTotal !== mt5TotalSum || ctraderBuy !== mt5BuySum || ctraderSell !== mt5SellSum) {
-            // 生成账户对的唯一标识（使用所有 MT5 账户ID的组合）
-            const mt5AccountsKey = allowedMT5Accounts.join('_');
-            const accountPairKey = `${ctraderAccountId}_${mt5AccountsKey}`;
-            const now = Date.now();
-            const lastSentTime = lastEmailSentTime[accountPairKey] || 0;
-            const timeSinceLastEmail = now - lastSentTime;
-            
-            // 判断是否需要发送邮件
-            // 1. 第一次检测到不匹配（lastSentTime === 0）：立即发送
-            // 2. 后续持续不匹配：需要间隔至少 EMAIL_NOTIFY_INTERVAL 才发送
-            const shouldSendEmail = lastSentTime === 0 || timeSinceLastEmail >= EMAIL_NOTIFY_INTERVAL;
-            
-            if (shouldSendEmail) {
+        if (isMismatch) {
+            if (!mismatchNotifyState[accountPairKey]) {
+                mismatchNotifyState[accountPairKey] = {
+                    notified: false,
+                    mismatchSince: now,
+                    lastSuppressedLogAt: 0
+                };
+            }
+
+            const state = mismatchNotifyState[accountPairKey];
+
+            // 仅在不匹配周期起点发送一次邮件（边沿触发）
+            if (!state.notified) {
                 // 构建 MT5 账户详情文本
                 let mt5DetailsText = '';
                 for (const detail of mt5AccountDetails) {
@@ -428,30 +441,34 @@ ${ctraderTotal === 0 && mt5TotalSum > 0 ? '⚠️  警告: MT5 EA 有仓位但 c
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ${new Date().toLocaleString('zh-CN')}
 
-${lastSentTime > 0 ? `\n📌 注：上次通知时间: ${new Date(lastSentTime).toLocaleString('zh-CN')}\n` : ''}
+${state?.mismatchSince ? `\n📌 注：本次不匹配开始时间: ${new Date(state.mismatchSince).toLocaleString('zh-CN')}\n` : ''}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 `.trim();
                 
+                // 先置位，确保发送失败也不会在持续不匹配期间反复轰炸 SMTP
+                state.notified = true;
                 try {
                     await sendEmail(emailSubject, emailBody, null, null);
-                    // 更新上次发送时间
-                    lastEmailSentTime[accountPairKey] = now;
                     console.log(`⚠️  仓位不匹配，已发送邮件通知: cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`);
                 } catch (emailError) {
                     serverLog('error', '❌ 发送仓位不匹配邮件失败:', emailError.message);
                     logEmailErrorDetail('仓位不匹配邮件', emailError);
                 }
             } else {
-                // 不发送邮件，但记录日志（降低频率）
-                const remainingTime = Math.ceil((EMAIL_NOTIFY_INTERVAL - timeSinceLastEmail) / 1000);
-                console.log(`⚠️  仓位不匹配（已抑制邮件，还需等待 ${remainingTime} 秒）: cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`);
+                // 持续不匹配：不再发邮件，仅低频打印抑制日志
+                const elapsedSec = Math.floor((now - state.mismatchSince) / 1000);
+                const canLogSuppressed = (now - state.lastSuppressedLogAt) >= MISMATCH_SUPPRESSED_LOG_INTERVAL;
+                if (canLogSuppressed) {
+                    console.log(`⚠️  仓位不匹配持续中（邮件已抑制，已持续 ${elapsedSec} 秒）: cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]`);
+                    state.lastSuppressedLogAt = now;
+                }
             }
         } else {
-            // 仓位匹配，清除该账户对的发送记录（下次不匹配时立即发送）
-            const mt5AccountsKey = allowedMT5Accounts.join('_');
-            const accountPairKey = `${ctraderAccountId}_${mt5AccountsKey}`;
-            if (lastEmailSentTime[accountPairKey]) {
-                delete lastEmailSentTime[accountPairKey];
+            // 仓位恢复匹配，清除该账户对状态（下次不匹配会再次发送一次）
+            if (mismatchNotifyState[accountPairKey]) {
+                const elapsedSec = Math.floor((now - mismatchNotifyState[accountPairKey].mismatchSince) / 1000);
+                console.log(`✅ 仓位已恢复匹配: cTrader ${ctraderAccountId} vs MT5 [${allowedMT5Accounts.join(', ')}]（本次不匹配持续 ${elapsedSec} 秒）`);
+                delete mismatchNotifyState[accountPairKey];
             }
         }
     } catch (error) {
@@ -1118,14 +1135,28 @@ app.get('/queue/read', (req, res) => {
             }
         }
 
-        // 如果有仓位信息，保存并比较
-        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
+        // cBot 仓位同步：只要带了任一仓位相关参数（含 accountPositions）就视为一次有效上报
+        const hasCtraderSyncPayload =
+            req.query.total !== undefined ||
+            req.query.totalPositions !== undefined ||
+            req.query.buy !== undefined ||
+            req.query.buyPositions !== undefined ||
+            req.query.sell !== undefined ||
+            req.query.sellPositions !== undefined ||
+            req.query.accountPositions !== undefined;
+        const accountPositionsTotal = Object.values(ctraderAccountPositions).reduce((sum, v) => sum + v, 0);
+        const resolvedCtraderBuy = ctraderBuy !== null ? ctraderBuy : 0;
+        const resolvedCtraderSell = ctraderSell !== null ? ctraderSell : 0;
+        const resolvedCtraderTotal = ctraderTotal !== null
+            ? ctraderTotal
+            : (resolvedCtraderBuy + resolvedCtraderSell > 0 ? (resolvedCtraderBuy + resolvedCtraderSell) : accountPositionsTotal);
+
+        if (hasCtraderSyncPayload) {
             const ctraderPos = {
-                total: ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : null),
-                buy: ctraderBuy !== null ? ctraderBuy : 0,
-                sell: ctraderSell !== null ? ctraderSell : 0
+                total: resolvedCtraderTotal,
+                buy: resolvedCtraderBuy,
+                sell: resolvedCtraderSell
             };
-            
             // 异步比较仓位信息（不阻塞响应）
             compareAndNotifyPositions(accountIdStr, ctraderPos).catch(err => {
                 console.error('❌ 比较仓位信息异常:', err.message);
@@ -1149,8 +1180,8 @@ app.get('/queue/read', (req, res) => {
         // 新字段 syncCloseInstructions 按 MT5 账号粒度下发；旧字段 syncCloseSymbols 保留兼容
         let syncCloseSymbols = [];
         let syncCloseInstructions = [];
-        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
-            const ctraderTotalVal = ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : 0);
+        if (hasCtraderSyncPayload) {
+            const ctraderTotalVal = resolvedCtraderTotal;
             if (ctraderTotalVal > 0) {
                 const defaultSymbols = [...(CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'])];
                 for (const id of allowedMT5Accounts) {
@@ -1325,13 +1356,27 @@ app.get('/queue/lease', (req, res) => {
             }
         }
 
-        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
-            const ctraderPos = {
-                total: ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : null),
-                buy: ctraderBuy !== null ? ctraderBuy : 0,
-                sell: ctraderSell !== null ? ctraderSell : 0
-            };
+        const hasCtraderSyncPayload =
+            req.query.total !== undefined ||
+            req.query.totalPositions !== undefined ||
+            req.query.buy !== undefined ||
+            req.query.buyPositions !== undefined ||
+            req.query.sell !== undefined ||
+            req.query.sellPositions !== undefined ||
+            req.query.accountPositions !== undefined;
+        const accountPositionsTotal = Object.values(ctraderAccountPositions).reduce((sum, v) => sum + v, 0);
+        const resolvedCtraderBuy = ctraderBuy !== null ? ctraderBuy : 0;
+        const resolvedCtraderSell = ctraderSell !== null ? ctraderSell : 0;
+        const resolvedCtraderTotal = ctraderTotal !== null
+            ? ctraderTotal
+            : (resolvedCtraderBuy + resolvedCtraderSell > 0 ? (resolvedCtraderBuy + resolvedCtraderSell) : accountPositionsTotal);
 
+        if (hasCtraderSyncPayload) {
+            const ctraderPos = {
+                total: resolvedCtraderTotal,
+                buy: resolvedCtraderBuy,
+                sell: resolvedCtraderSell
+            };
             compareAndNotifyPositions(accountIdStr, ctraderPos).catch(err => {
                 console.error('❌ 比较仓位信息异常:', err.message);
             });
@@ -1350,8 +1395,8 @@ app.get('/queue/lease', (req, res) => {
 
         let syncCloseSymbols = [];
         let syncCloseInstructions = [];
-        if (ctraderTotal !== null || ctraderBuy !== null || ctraderSell !== null) {
-            const ctraderTotalVal = ctraderTotal !== null ? ctraderTotal : (ctraderBuy !== null && ctraderSell !== null ? ctraderBuy + ctraderSell : 0);
+        if (hasCtraderSyncPayload) {
+            const ctraderTotalVal = resolvedCtraderTotal;
             if (ctraderTotalVal > 0) {
                 const defaultSymbols = [...(CONFIG.POSITION_CHECK_SYMBOLS || ['XAUUSD'])];
                 for (const id of allowedMT5Accounts) {
